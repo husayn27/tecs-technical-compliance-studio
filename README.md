@@ -1,6 +1,12 @@
 # TECS Technical Compliance Studio
 
-A private desktop workflow for building lighting technical-compliance submissions from engineer-entered requirements or extracted PDF drawings. It compares specified and proposed products and exports one technical data sheet per fitting in Excel or PDF.
+A desktop workflow for building lighting technical-compliance submissions from engineer-entered requirements or extracted PDF drawings. It compares specified and proposed products and exports one technical data sheet per fitting in Excel or PDF.
+
+## API key security
+
+No OpenAI API key is included in this repository, its release installers, or the application defaults. Every user must open **API settings** in the application and enter their own key before product search can run.
+
+The key is stored locally in that user's operating-system credential store. It is not written into project files, exports, source code, or the TECS repository. Users can replace or remove it at any time from **API settings**. Never add API keys to source files, `.env` files committed to Git, build scripts, screenshots, issues, or release assets.
 
 ## User workflow
 

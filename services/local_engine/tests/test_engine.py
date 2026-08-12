@@ -326,6 +326,7 @@ def test_health_and_quote_endpoints(monkeypatch) -> None:
 
 
 def test_api_key_can_be_saved_and_removed(monkeypatch) -> None:
+    test_api_key = "test-api-key-value-long-enough-for-validation"
     saved: list[str] = []
     monkeypatch.setattr("tecs_engine.main.save_api_key", saved.append)
     monkeypatch.setattr("tecs_engine.main.delete_api_key", lambda: False)
@@ -333,10 +334,10 @@ def test_api_key_can_be_saved_and_removed(monkeypatch) -> None:
 
     save_response = client.post(
         "/api/settings/api-key",
-        json={"api_key": "sk-test-key-long-enough-for-validation"},
+        json={"api_key": test_api_key},
     )
     assert save_response.status_code == 200
-    assert saved == ["sk-test-key-long-enough-for-validation"]
+    assert saved == [test_api_key]
 
     remove_response = client.delete("/api/settings/api-key")
     assert remove_response.status_code == 200
