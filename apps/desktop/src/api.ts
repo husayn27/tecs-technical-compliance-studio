@@ -24,6 +24,12 @@ export async function saveApiKey(apiKey: string) {
   );
 }
 
+export async function removeApiKey() {
+  return parsed<{ removed: boolean; api_key_configured: boolean }>(
+    await fetch(`${BASE_URL}/settings/api-key`, { method: "DELETE" }),
+  );
+}
+
 export async function extract(projectName: string, files: File[]) {
   const form = new FormData();
   files.forEach((file) => form.append("files", file));

@@ -15,12 +15,13 @@ import {
   Plus,
   Search,
   Save,
+  Settings,
   ShieldCheck,
   Trash2,
   UploadCloud,
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
-import { approveFixtures, downloadCompliance, extract, health, saveApiKey, searchProducts } from "./api";
+import { approveFixtures, downloadCompliance, extract, health, removeApiKey, saveApiKey, searchProducts } from "./api";
 import tecsLogo from "./assets/tecs-logo.png";
 import type { ComplianceItem, ComplianceRow, ComplianceStatus, Fixture, LegendRequirements, LocalAIStatus, Product, ProjectDetails } from "./types";
 
@@ -350,6 +351,8 @@ export default function App() {
   const [localAI, setLocalAI] = useState<LocalAIStatus | null>(null);
   const [apiReady, setApiReady] = useState(false);
   const [apiKey, setApiKey] = useState("");
+  const [apiSettingsOpen, setApiSettingsOpen] = useState(false);
+  const [apiSettingsMessage, setApiSettingsMessage] = useState("");
   const [searching, setSearching] = useState("");
   const [searchResults, setSearchResults] = useState<Record<string, Product[]>>({});
   const [selectedMatches, setSelectedMatches] = useState<Record<string, string>>({});
@@ -503,8 +506,26 @@ export default function App() {
       await saveApiKey(apiKey.trim());
       setApiKey("");
       setApiReady(true);
+      setApiSettingsMessage("API key saved securely on this computer.");
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Could not save the API key.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function clearApiKey() {
+    setBusy(true);
+    setError("");
+    try {
+      const response = await removeApiKey();
+      setApiKey("");
+      setApiReady(response.api_key_configured);
+      setApiSettingsMessage(response.api_key_configured
+        ? "The saved key was removed, but an environment-provided key is still active."
+        : "API key removed from this computer.");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not remove the API key.");
     } finally {
       setBusy(false);
     }
@@ -563,8 +584,9 @@ export default function App() {
       <main className="main-panel">
         <header className="topbar">
           <div><span className="eyebrow">TECS LIGHTING</span><h1>{STEPS[step]}</h1></div>
-          <div className="top-statuses"><div className={`engine-chip ${localAI?.available ? "ready" : ""}`}><ShieldCheck size={14} />{localAI?.available ? "Drawing AI ready" : "Manual mode ready"}</div><div className={`engine-chip ${apiReady ? "ready" : ""}`}><Search size={14} />{apiReady ? "Product API ready" : "Product API setup required"}</div></div>
+          <div className="top-statuses"><div className={`engine-chip ${localAI?.available ? "ready" : ""}`}><ShieldCheck size={14} />{localAI?.available ? "Drawing AI ready" : "Manual mode ready"}</div><button className={`engine-chip api-settings-trigger ${apiReady ? "ready" : ""}`} onClick={() => { setApiSettingsMessage(""); setApiSettingsOpen(true); }}><Settings size={14} />{apiReady ? "API settings" : "Set up product API"}</button></div>
         </header>
+        {apiSettingsOpen && <div className="settings-overlay" onMouseDown={(event) => event.target === event.currentTarget && setApiSettingsOpen(false)}><section className="settings-panel" role="dialog" aria-modal="true" aria-labelledby="api-settings-title"><div className="settings-header"><div className="settings-icon"><KeyRound size={20} /></div><div><span className="section-kicker">PRODUCT SEARCH</span><h2 id="api-settings-title">OpenAI API settings</h2></div><button className="settings-close" onClick={() => setApiSettingsOpen(false)} aria-label="Close settings">×</button></div><p className="settings-description">The key is stored securely on this computer and is used only for official manufacturer product searches.</p><div className={`api-key-status ${apiReady ? "configured" : "missing"}`}><span></span><strong>{apiReady ? "API key configured" : "No API key configured"}</strong></div><label><span>{apiReady ? "Enter a replacement key" : "OpenAI API key"}</span><input type="password" autoComplete="off" value={apiKey} onChange={(event) => { setApiKey(event.target.value); setApiSettingsMessage(""); }} /></label>{apiSettingsMessage && <div className="settings-message">{apiSettingsMessage}</div>}<div className="settings-actions">{apiReady && <button className="remove-key" disabled={busy} onClick={clearApiKey}><Trash2 size={15} />Remove key</button>}<button className="primary" disabled={!apiKey.trim() || busy} onClick={configureApiKey}>{busy ? <LoaderCircle className="spin" size={15} /> : <Save size={15} />}{apiReady ? "Save replacement" : "Save API key"}</button></div></section></div>}
         {error && <div className="error-banner">{error}<button onClick={() => setError("")}>Dismiss</button></div>}
 
         {step === 0 && (
@@ -647,7 +669,7 @@ export default function App() {
               {activeItem && <div className="editor-card product-editor">
                 <div className="ai-search-panel">
                   <div className="search-panel-copy"><div className="ai-icon"><Search size={18} /></div><div><strong>Official {activeItem.brand} product search</strong><span>Only the approved manufacturer domain is searched. Results are scored against the engineer-entered requirement.</span></div></div>
-                  {!apiReady ? <div className="api-key-setup"><KeyRound size={16} /><input type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder="Enter OpenAI API key" /><button className="primary" disabled={!apiKey.trim() || busy} onClick={configureApiKey}>Save API key</button></div> : <div className="search-controls"><label className="tolerance-field"><span>Lumens ±</span><input type="number" min="0" max="100" value={searchTolerance.lumens_percent} onChange={(event) => setSearchTolerance((current) => ({ ...current, lumens_percent: Number(event.target.value) }))} /><small>%</small></label><label className="tolerance-field"><span>Watts ±</span><input type="number" min="0" max="100" value={searchTolerance.wattage_percent} onChange={(event) => setSearchTolerance((current) => ({ ...current, wattage_percent: Number(event.target.value) }))} /><small>%</small></label><button className="primary" disabled={searching === activeItem.id} onClick={() => findBestProducts(activeItem)}>{searching === activeItem.id ? <LoaderCircle className="spin" size={16} /> : <Search size={16} />}Search matching options</button></div>}
+                  {!apiReady ? <button className="outline api-settings-shortcut" onClick={() => setApiSettingsOpen(true)}><Settings size={16} />Configure API in settings</button> : <div className="search-controls"><label className="tolerance-field"><span>Lumens ±</span><input type="number" min="0" max="100" value={searchTolerance.lumens_percent} onChange={(event) => setSearchTolerance((current) => ({ ...current, lumens_percent: Number(event.target.value) }))} /><small>%</small></label><label className="tolerance-field"><span>Watts ±</span><input type="number" min="0" max="100" value={searchTolerance.wattage_percent} onChange={(event) => setSearchTolerance((current) => ({ ...current, wattage_percent: Number(event.target.value) }))} /><small>%</small></label><button className="primary" disabled={searching === activeItem.id} onClick={() => findBestProducts(activeItem)}>{searching === activeItem.id ? <LoaderCircle className="spin" size={16} /> : <Search size={16} />}Search matching options</button></div>}
                 </div>
                 <div className="product-identity">
                   <label><span>Brand</span><select value={activeItem.brand} onChange={(event) => updateIdentity(activeItem.id, "brand", event.target.value)}>{BRANDS.map((brand) => <option key={brand.name}>{brand.name}</option>)}</select></label>

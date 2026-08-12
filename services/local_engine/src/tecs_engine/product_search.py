@@ -305,6 +305,14 @@ def save_api_key(api_key: str) -> None:
     keyring.set_password(KEYRING_SERVICE, KEYRING_USER, api_key)
 
 
+def delete_api_key() -> bool:
+    try:
+        keyring.delete_password(KEYRING_SERVICE, KEYRING_USER)
+    except keyring.errors.PasswordDeleteError:
+        pass
+    return bool(os.getenv("OPENAI_API_KEY"))
+
+
 def has_api_key() -> bool:
     if os.getenv("OPENAI_API_KEY"):
         return True

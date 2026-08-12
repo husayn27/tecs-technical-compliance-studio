@@ -22,7 +22,7 @@ from .models import (
     TechnicalSheetRequest,
 )
 from .compliance import build_compliance_pdf, build_compliance_xlsx
-from .product_search import has_api_key, save_api_key, search_products
+from .product_search import delete_api_key, has_api_key, save_api_key, search_products
 from .quote import build_pdf, build_xlsx
 from .storage import KnowledgeStore
 
@@ -37,7 +37,7 @@ app.add_middleware(
         "tauri://localhost",
     ],
     allow_credentials=False,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["*"],
 )
 
@@ -65,6 +65,11 @@ def learning_stats() -> dict:
 def configure_api_key(request: ApiKeyRequest) -> dict:
     save_api_key(request.api_key)
     return {"saved": True}
+
+
+@app.delete("/api/settings/api-key")
+def remove_api_key() -> dict:
+    return {"removed": True, "api_key_configured": delete_api_key()}
 
 
 @app.post("/api/extract", response_model=ExtractionResponse)

@@ -323,3 +323,24 @@ def test_health_and_quote_endpoints(monkeypatch) -> None:
     assert response.status_code == 200
     assert response.headers["content-type"] == "application/pdf"
     assert response.content.startswith(b"%PDF")
+
+
+def test_api_key_can_be_saved_and_removed(monkeypatch) -> None:
+    saved: list[str] = []
+    monkeypatch.setattr("tecs_engine.main.save_api_key", saved.append)
+    monkeypatch.setattr("tecs_engine.main.delete_api_key", lambda: False)
+    client = TestClient(app)
+
+    save_response = client.post(
+        "/api/settings/api-key",
+        json={"api_key": "sk-test-key-long-enough-for-validation"},
+    )
+    assert save_response.status_code == 200
+    assert saved == ["sk-test-key-long-enough-for-validation"]
+
+    remove_response = client.delete("/api/settings/api-key")
+    assert remove_response.status_code == 200
+    assert remove_response.json() == {
+        "removed": True,
+        "api_key_configured": False,
+    }
