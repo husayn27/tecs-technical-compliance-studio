@@ -1,0 +1,15 @@
+.DS_Store
+.env
+.venv/
+__pycache__/
+*.pyc
+node_modules/
+.pnpm-store/
+dist/
+tmp/
+build/
+*.spec
+src-tauri/target/
+*.tsbuildinfo
+services/local_engine/runtime/*
+!services/local_engine/runtime/LICENSE

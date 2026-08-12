@@ -1,0 +1,62 @@
+name: macOS application
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build-macos:
+    runs-on: macos-14
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install local engine
+        run: pip install -e "services/local_engine[dev,ocr]"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+          run_install: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build private local engine sidecar
+        run: |
+          pyinstaller --noconfirm --clean --onefile \
+            --name tecs-engine \
+            --paths services/local_engine/src \
+            --collect-all rapidocr \
+            --collect-all onnxruntime \
+            services/local_engine/sidecar_entry.py
+          target_triple="$(rustc -vV | sed -n 's/^host: //p')"
+          mkdir -p apps/desktop/src-tauri/binaries
+          cp dist/tecs-engine "apps/desktop/src-tauri/binaries/tecs-engine-${target_triple}"
+
+      - name: Install desktop dependencies
+        working-directory: apps/desktop
+        run: pnpm install --frozen-lockfile
+
+      - name: Build macOS application and DMG
+        working-directory: apps/desktop
+        run: pnpm tauri build --bundles app,dmg
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TECS-Lighting-Quotation-macOS
+          path: |
+            apps/desktop/src-tauri/target/release/bundle/dmg/*.dmg
+            apps/desktop/src-tauri/target/release/bundle/macos/*.app
+          if-no-files-found: error

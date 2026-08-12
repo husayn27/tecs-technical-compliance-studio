@@ -1,0 +1,31 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "TECS Technical Compliance Studio",
+  "version": "0.1.0",
+  "identifier": "com.tecs.lightingquotation",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [{
+      "title": "TECS Technical Compliance Studio",
+      "width": 1320,
+      "height": 850,
+      "minWidth": 1060,
+      "minHeight": 720,
+      "center": true
+    }],
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' http://127.0.0.1:8765; img-src 'self' data: https:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "externalBin": ["binaries/tecs-engine"],
+    "windows": { "wix": { "language": "en-US" } }
+  }
+}
