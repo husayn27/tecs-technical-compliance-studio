@@ -203,3 +203,16 @@ def test_only_official_product_urls_are_accepted() -> None:
     assert _official_url("https://www.signify.com/product", "signify.com")
     assert _official_url("https://cdn.signify.com/file.pdf", "signify.com")
     assert _official_url("https://example.com/fake", "signify.com") is None
+
+
+def test_brand_specific_official_cdn_urls_are_accepted() -> None:
+    luxeled_cdn = "90b00135-5a72-4c01-b37e-1f0325f9da2e.usrfiles.com"
+    datasheet = f"https://{luxeled_cdn}/ugd/90b001_datasheet.pdf"
+
+    assert _official_url(datasheet, "luxeled.com", (luxeled_cdn,)) == datasheet
+    assert _official_url(datasheet, "signify.com") is None
+    assert _official_url(
+        "https://unrelated.usrfiles.com/ugd/fake.pdf",
+        "luxeled.com",
+        (luxeled_cdn,),
+    ) is None

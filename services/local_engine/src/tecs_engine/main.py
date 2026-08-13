@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Annotated
@@ -28,6 +30,21 @@ from .storage import KnowledgeStore
 
 app = FastAPI(title="TECS Lighting Engine", version="0.1.0")
 knowledge = KnowledgeStore()
+
+
+def _save_export(content: bytes, filename: str, extension: str) -> dict[str, str | bool]:
+    safe_stem = Path(filename).stem
+    safe_stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "-", safe_stem).strip(" .-")
+    safe_stem = safe_stem[:120] or "TECS-Technical-Compliance"
+    export_dir = Path(os.getenv("TECS_EXPORT_DIR", Path.home() / "Downloads"))
+    export_dir.mkdir(parents=True, exist_ok=True)
+    target = export_dir / f"{safe_stem}.{extension}"
+    copy_number = 2
+    while target.exists():
+        target = export_dir / f"{safe_stem} ({copy_number}).{extension}"
+        copy_number += 1
+    target.write_bytes(content)
+    return {"saved": True, "filename": target.name, "path": str(target)}
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -234,6 +251,17 @@ def compliance_xlsx(request: TechnicalSheetRequest) -> Response:
     )
 
 
+@app.post("/api/compliance/xlsx/save")
+def save_compliance_xlsx(
+    request: TechnicalSheetRequest,
+    filename: str = "TECS-Technical-Compliance",
+) -> dict[str, str | bool]:
+    try:
+        return _save_export(build_compliance_xlsx(request), filename, "xlsx")
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+
 @app.post("/api/compliance/pdf")
 def compliance_pdf(request: TechnicalSheetRequest) -> Response:
     try:
@@ -245,6 +273,17 @@ def compliance_pdf(request: TechnicalSheetRequest) -> Response:
         media_type="application/pdf",
         headers={"Content-Disposition": 'attachment; filename="TECS-Technical-Compliance.pdf"'},
     )
+
+
+@app.post("/api/compliance/pdf/save")
+def save_compliance_pdf(
+    request: TechnicalSheetRequest,
+    filename: str = "TECS-Technical-Compliance",
+) -> dict[str, str | bool]:
+    try:
+        return _save_export(build_compliance_pdf(request), filename, "pdf")
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
 
 
 def run() -> None:

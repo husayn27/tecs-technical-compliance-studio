@@ -308,6 +308,43 @@ def test_builds_individual_compliance_sheets() -> None:
     assert "Offered input power is 2 W higher" in text
 
 
+def test_compliance_export_saves_to_configured_download_folder(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("TECS_EXPORT_DIR", str(tmp_path))
+    request = TechnicalSheetRequest(
+        project=ProjectDetails(project_name="Windows Export Test"),
+        items=[
+            TechnicalItem(
+                id="f1",
+                fitting_type="F1",
+                brand="LuxeLED",
+                product_name="Mellow III",
+                model_no="MEL III-4K-40W-595-IP54-S",
+                rows=[
+                    ComplianceRow(
+                        parameter="Wattage",
+                        specified="40 W",
+                        proposed="40 W",
+                        status="complies",
+                    )
+                ],
+            )
+        ],
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/compliance/xlsx/save?filename=F1-Technical-Compliance",
+        json=request.model_dump(mode="json"),
+    )
+
+    assert response.status_code == 200
+    saved_path = Path(response.json()["path"])
+    assert saved_path == tmp_path / "F1-Technical-Compliance.xlsx"
+    assert saved_path.read_bytes().startswith(b"PK")
+
+
 def test_health_and_quote_endpoints(monkeypatch) -> None:
     monkeypatch.setattr("tecs_engine.main.has_api_key", lambda: False)
     client = TestClient(app)

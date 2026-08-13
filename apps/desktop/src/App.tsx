@@ -12,6 +12,7 @@ import {
   FolderOpen,
   LoaderCircle,
   KeyRound,
+  Minus,
   Plus,
   Search,
   Save,
@@ -21,7 +22,7 @@ import {
   UploadCloud,
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
-import { approveFixtures, downloadCompliance, extract, health, removeApiKey, saveApiKey, searchProducts } from "./api";
+import { approveFixtures, downloadCompliance, extract, health, openExternalUrl, removeApiKey, saveApiKey, searchProducts } from "./api";
 import tecsLogo from "./assets/tecs-logo.png";
 import type { ComplianceItem, ComplianceRow, ComplianceStatus, Fixture, LegendRequirements, LocalAIStatus, Product, ProjectDetails } from "./types";
 
@@ -49,6 +50,8 @@ const BRANDS = [
   { name: "Francisconi", domain: "francesconi.it" },
   { name: "Whitecroft Lighting", domain: "whitecroftlighting.com" },
 ];
+
+const UI_ZOOM_KEY = "tecs-ui-zoom";
 
 const PARAMETERS = [
   "Description",
@@ -348,7 +351,9 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [warnings, setWarnings] = useState<string[]>([]);
+  const [success, setSuccess] = useState("");
   const [localAI, setLocalAI] = useState<LocalAIStatus | null>(null);
+  const [serviceStatus, setServiceStatus] = useState<"checking" | "ready" | "offline">("checking");
   const [apiReady, setApiReady] = useState(false);
   const [apiKey, setApiKey] = useState("");
   const [apiSettingsOpen, setApiSettingsOpen] = useState(false);
@@ -360,6 +365,10 @@ export default function App() {
   const [candidatePrices, setCandidatePrices] = useState<Record<string, string>>({});
   const [priceCurrency, setPriceCurrency] = useState<"OMR" | "AED" | "USD">("OMR");
   const [restored, setRestored] = useState(false);
+  const [uiZoom, setUiZoom] = useState(() => {
+    const saved = Number(localStorage.getItem(UI_ZOOM_KEY));
+    return saved >= 80 && saved <= 150 ? saved : 100;
+  });
 
   useEffect(() => {
     try {
@@ -374,8 +383,35 @@ export default function App() {
       localStorage.removeItem(STORAGE_KEY);
     }
     setRestored(true);
-    health().then((value) => { setLocalAI(value.local_ai); setApiReady(value.api_key_configured); }).catch(() => setLocalAI(null));
+    let cancelled = false;
+    let retryTimer: number | undefined;
+    let attempts = 0;
+    const checkService = async () => {
+      try {
+        const value = await health();
+        if (cancelled) return;
+        setLocalAI(value.local_ai);
+        setApiReady(value.api_key_configured);
+        setServiceStatus("ready");
+      } catch {
+        if (cancelled) return;
+        attempts += 1;
+        setLocalAI(null);
+        if (attempts < 45) retryTimer = window.setTimeout(checkService, 1000);
+        else setServiceStatus("offline");
+      }
+    };
+    void checkService();
+    return () => {
+      cancelled = true;
+      if (retryTimer) window.clearTimeout(retryTimer);
+    };
   }, []);
+
+  useEffect(() => {
+    document.body.style.zoom = `${uiZoom}%`;
+    localStorage.setItem(UI_ZOOM_KEY, String(uiZoom));
+  }, [uiZoom]);
 
   useEffect(() => {
     if (!restored) return;
@@ -499,7 +535,7 @@ export default function App() {
   }
 
   async function configureApiKey() {
-    if (!apiKey.trim()) return;
+    if (!apiKey.trim() || serviceStatus !== "ready") return;
     setBusy(true);
     setError("");
     try {
@@ -555,14 +591,25 @@ export default function App() {
   async function exportSheets(format: "xlsx" | "pdf", only?: ComplianceItem) {
     setBusy(true);
     setError("");
+    setSuccess("");
     try {
       const exportItems = only ? [{ ...only, selected: true }] : items;
       const suffix = only ? `${only.fitting_type.replace(/[^a-z0-9]+/gi, "-")}-Technical-Compliance` : "TECS-Technical-Compliance";
-      await downloadCompliance(format, project, exportItems, suffix);
+      const result = await downloadCompliance(format, project, exportItems, suffix);
+      setSuccess(`Saved ${result.filename} to ${result.path}`);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Could not create the technical sheets.");
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function openOfficialLink(url: string) {
+    setError("");
+    try {
+      await openExternalUrl(url);
+    } catch {
+      setError("Windows could not open this link in the default browser. Check the default browser setting and try again.");
     }
   }
 
@@ -584,10 +631,11 @@ export default function App() {
       <main className="main-panel">
         <header className="topbar">
           <div><span className="eyebrow">TECS LIGHTING</span><h1>{STEPS[step]}</h1></div>
-          <div className="top-statuses"><div className={`engine-chip ${localAI?.available ? "ready" : ""}`}><ShieldCheck size={14} />{localAI?.available ? "Drawing AI ready" : "Manual mode ready"}</div><button className={`engine-chip api-settings-trigger ${apiReady ? "ready" : ""}`} onClick={() => { setApiSettingsMessage(""); setApiSettingsOpen(true); }}><Settings size={14} />{apiReady ? "API settings" : "Set up product API"}</button></div>
+          <div className="top-statuses"><div className="zoom-controls" aria-label="Interface zoom"><button disabled={uiZoom <= 80} onClick={() => setUiZoom((value) => Math.max(80, value - 10))} title="Make interface smaller"><Minus size={13} /></button><button className="zoom-value" onClick={() => setUiZoom(100)} title="Reset interface size">{uiZoom}%</button><button disabled={uiZoom >= 150} onClick={() => setUiZoom((value) => Math.min(150, value + 10))} title="Make interface larger"><Plus size={13} /></button></div><div className={`engine-chip ${localAI?.available ? "ready" : ""}`}><ShieldCheck size={14} />{localAI?.available ? "Drawing AI ready" : "Manual mode ready"}</div><button className={`engine-chip api-settings-trigger ${apiReady ? "ready" : ""} ${serviceStatus === "offline" ? "offline" : ""}`} onClick={() => { setApiSettingsMessage(serviceStatus === "offline" ? "The local TECS service is not running. Restart the application, then try again." : ""); setApiSettingsOpen(true); }}><Settings size={14} />{serviceStatus === "checking" ? "Connecting to local service…" : serviceStatus === "offline" ? "Local service offline" : apiReady ? "API settings" : "Set up product API"}</button></div>
         </header>
-        {apiSettingsOpen && <div className="settings-overlay" onMouseDown={(event) => event.target === event.currentTarget && setApiSettingsOpen(false)}><section className="settings-panel" role="dialog" aria-modal="true" aria-labelledby="api-settings-title"><div className="settings-header"><div className="settings-icon"><KeyRound size={20} /></div><div><span className="section-kicker">PRODUCT SEARCH</span><h2 id="api-settings-title">OpenAI API settings</h2></div><button className="settings-close" onClick={() => setApiSettingsOpen(false)} aria-label="Close settings">×</button></div><p className="settings-description">The key is stored securely on this computer and is used only for official manufacturer product searches.</p><div className={`api-key-status ${apiReady ? "configured" : "missing"}`}><span></span><strong>{apiReady ? "API key configured" : "No API key configured"}</strong></div><label><span>{apiReady ? "Enter a replacement key" : "OpenAI API key"}</span><input type="password" autoComplete="off" value={apiKey} onChange={(event) => { setApiKey(event.target.value); setApiSettingsMessage(""); }} /></label>{apiSettingsMessage && <div className="settings-message">{apiSettingsMessage}</div>}<div className="settings-actions">{apiReady && <button className="remove-key" disabled={busy} onClick={clearApiKey}><Trash2 size={15} />Remove key</button>}<button className="primary" disabled={!apiKey.trim() || busy} onClick={configureApiKey}>{busy ? <LoaderCircle className="spin" size={15} /> : <Save size={15} />}{apiReady ? "Save replacement" : "Save API key"}</button></div></section></div>}
+        {apiSettingsOpen && <div className="settings-overlay" onMouseDown={(event) => event.target === event.currentTarget && setApiSettingsOpen(false)}><section className="settings-panel" role="dialog" aria-modal="true" aria-labelledby="api-settings-title"><div className="settings-header"><div className="settings-icon"><KeyRound size={20} /></div><div><span className="section-kicker">PRODUCT SEARCH</span><h2 id="api-settings-title">OpenAI API settings</h2></div><button className="settings-close" onClick={() => setApiSettingsOpen(false)} aria-label="Close settings">×</button></div><p className="settings-description">The key is stored securely on this computer and is used only for official manufacturer product searches.</p><div className={`api-key-status ${serviceStatus === "offline" ? "offline" : apiReady ? "configured" : "missing"}`}><span></span><strong>{serviceStatus === "checking" ? "Connecting to the local TECS service…" : serviceStatus === "offline" ? "Local TECS service is offline" : apiReady ? "API key configured" : "No API key configured"}</strong></div><label><span>{apiReady ? "Enter a replacement key" : "OpenAI API key"}</span><input type="password" autoComplete="off" disabled={serviceStatus !== "ready"} value={apiKey} onChange={(event) => { setApiKey(event.target.value); setApiSettingsMessage(""); }} /></label>{apiSettingsMessage && <div className={`settings-message ${serviceStatus === "offline" ? "error" : ""}`}>{apiSettingsMessage}</div>}<div className="settings-actions">{apiReady && <button className="remove-key" disabled={busy || serviceStatus !== "ready"} onClick={clearApiKey}><Trash2 size={15} />Remove key</button>}<button className="primary" disabled={!apiKey.trim() || busy || serviceStatus !== "ready"} onClick={configureApiKey}>{busy ? <LoaderCircle className="spin" size={15} /> : <Save size={15} />}{apiReady ? "Save replacement" : "Save API key"}</button></div></section></div>}
         {error && <div className="error-banner">{error}<button onClick={() => setError("")}>Dismiss</button></div>}
+        {success && <div className="success-banner">{success}<button onClick={() => setSuccess("")}>Dismiss</button></div>}
 
         {step === 0 && (
           <section className="content project-step">
@@ -687,7 +735,7 @@ export default function App() {
                     const hasMismatch = product.criteria.some((criterion) => criterion.status === "mismatch");
                     const hasUnknown = product.criteria.some((criterion) => criterion.status === "unknown");
                     return <article className={`api-product ${selectedMatches[activeItem.id] === product.id ? "selected" : ""}`} key={product.id}>
-                      <div className="result-rank">#{index + 1}</div><div className="result-main"><strong>{product.product_name}</strong><span>{product.product_code || "Order code not published"} · {matchSummary(product)}</span><div className="product-facts">{productFacts(product).map((fact) => <small key={fact}>{fact}</small>)}</div><div className="result-links"><a href={product.product_url} target="_blank" rel="noreferrer">Official product <ExternalLink size={11} /></a>{product.datasheet_url && <a href={product.datasheet_url} target="_blank" rel="noreferrer">Datasheet <ExternalLink size={11} /></a>}</div></div><div className={`result-score ${product.score >= 80 ? "high" : ""}`}>{product.score}%<small>match</small></div><button className={selectedMatches[activeItem.id] === product.id ? "selected-product" : "select-product"} onClick={() => finalizeProduct(activeItem, product)}>{selectedMatches[activeItem.id] === product.id ? <><Check size={14} />Finalized</> : "Use product"}</button>
+                      <div className="result-rank">#{index + 1}</div><div className="result-main"><strong>{product.product_name}</strong><span>{product.product_code || "Order code not published"} · {matchSummary(product)}</span><div className="product-facts">{productFacts(product).map((fact) => <small key={fact}>{fact}</small>)}</div><div className="result-links"><button onClick={() => openOfficialLink(product.product_url)}>Official product <ExternalLink size={11} /></button>{product.datasheet_url && <button onClick={() => openOfficialLink(product.datasheet_url!)}>Datasheet <ExternalLink size={11} /></button>}</div></div><div className={`result-score ${product.score >= 80 ? "high" : ""}`}>{product.score}%<small>match</small></div><button className={selectedMatches[activeItem.id] === product.id ? "selected-product" : "select-product"} onClick={() => finalizeProduct(activeItem, product)}>{selectedMatches[activeItem.id] === product.id ? <><Check size={14} />Finalized</> : "Use product"}</button>
                       <div className="commercial-row"><span className={`tolerance-badge ${hasMismatch ? "outside" : hasUnknown ? "verify" : "inside"}`}>{hasMismatch ? "Outside one or more limits" : hasUnknown ? "Within known limits · verify gaps" : "Within selected tolerance"}</span><label><span>Quoted unit price</span><select className="currency-select" value={priceCurrency} onChange={(event) => setPriceCurrency(event.target.value as "OMR" | "AED" | "USD")}><option value="OMR">OMR</option><option value="AED">AED</option><option value="USD">USD</option></select><input type="number" min="0" step="0.001" value={candidatePrices[priceKey] || ""} onChange={(event) => setCandidatePrices((current) => ({ ...current, [priceKey]: event.target.value }))} placeholder="Optional" /></label>{unitPrice > 0 && activeItem.quantity > 0 && <strong>Total: {priceCurrency} {(unitPrice * activeItem.quantity).toLocaleString(undefined, { maximumFractionDigits: 3 })}</strong>}</div>
                       <details className="criteria-details"><summary>View requirement comparison ({product.criteria.length})</summary><div className="criteria-grid"><strong>Category</strong><strong>Required</strong><strong>Offered</strong><strong>Result</strong>{product.criteria.map((criterion) => <div className="criterion-row" key={criterion.criterion}><span>{criterion.criterion}</span><span>{criterion.required}</span><span>{criterion.offered}</span><span className={`criterion-status ${criterion.status}`}>{criterion.status}</span></div>)}</div></details>
                     </article>;

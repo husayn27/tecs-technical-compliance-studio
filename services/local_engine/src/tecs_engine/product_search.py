@@ -44,6 +44,22 @@ APPROVED_BRANDS = {
     "Whitecroft Lighting": "whitecroftlighting.com",
 }
 
+# Some manufacturers publish their own datasheets on a separately hosted CDN.
+# Keep this allowlist brand-specific and host-specific: generic CDN domains are
+# never trusted for every brand.
+TRUSTED_ASSET_DOMAINS = {
+    "LuxeLED": (
+        "90b00135-5a72-4c01-b37e-1f0325f9da2e.usrfiles.com",
+    ),
+}
+
+VERIFIED_RESEARCH_STARTING_POINTS = {
+    "LuxeLED": (
+        "https://www.luxeled.com/product-page/mellow-iii",
+        "https://90b00135-5a72-4c01-b37e-1f0325f9da2e.usrfiles.com/ugd/90b001_efb17c738c5d441cb8b5034f692dddb0.pdf",
+    ),
+}
+
 
 def _anonymous_requirement(request: ProductSearchRequest) -> dict:
     fixture = request.fixture
@@ -293,12 +309,20 @@ def _score_product(
     return round(score, 1), [item for item, _ in criteria]
 
 
-def _official_url(value: str | None, domain: str) -> str | None:
+def _official_url(
+    value: str | None,
+    domain: str,
+    trusted_asset_domains: tuple[str, ...] = (),
+) -> str | None:
     if not value:
         return None
     hostname = (urlparse(value).hostname or "").lower()
-    allowed = domain.lower().removeprefix("www.")
-    return value if hostname == allowed or hostname.endswith(f".{allowed}") else None
+    allowed_domains = (domain, *trusted_asset_domains)
+    for candidate in allowed_domains:
+        allowed = candidate.lower().removeprefix("www.")
+        if hostname == allowed or hostname.endswith(f".{allowed}"):
+            return value
+    return None
 
 
 def save_api_key(api_key: str) -> None:
@@ -333,14 +357,20 @@ def search_products(request: ProductSearchRequest) -> ProductSearchResponse:
     approved_domain = APPROVED_BRANDS.get(request.brand)
     if not approved_domain:
         raise ValueError("The selected manufacturer is not approved.")
+    trusted_asset_domains = TRUSTED_ASSET_DOMAINS.get(request.brand, ())
+    search_domains = [approved_domain, *trusted_asset_domains]
+    research_starting_points = VERIFIED_RESEARCH_STARTING_POINTS.get(request.brand, ())
     client = OpenAI(api_key=_api_key())
     fixture = _anonymous_requirement(request)
     tolerance = request.tolerances.model_dump(mode="json")
     prompt = f"""
 Search the official {request.brand} website for all distinct currently published,
-orderable lighting products in the same fitting category that match this fixture
-requirement. Return up to fifteen relevant options, including every option you can
-verify within the permitted tolerances.
+orderable lighting products in the same fitting category as this fixture. Return up
+to fifteen credible category-compatible candidates. Do not return an empty list just
+because an exact wattage, lumen value, or other specification is not visible in the
+first page snippet: inspect the product page and its linked datasheet, and return null
+for genuinely unpublished values. The application performs the final numerical
+tolerance checks locally.
 
 Requirement JSON:
 {json.dumps(fixture, indent=2)}
@@ -348,10 +378,21 @@ Requirement JSON:
 Permitted tolerances:
 {json.dumps(tolerance, indent=2)}
 
+Verified official research starting points for this manufacturer:
+{json.dumps(research_starting_points, indent=2)}
+
 Rules:
 - Use only official manufacturer product or datasheet pages.
+- Follow datasheet links published on the official product page, including the
+  approved manufacturer CDN domains: {", ".join(trusted_asset_domains) or "none"}.
+- Prefer the official manufacturer product page as product_url and its linked PDF
+  as datasheet_url. A manufacturer-CDN PDF may be used as product_url only when no
+  dedicated official product page is available.
 - Return exact orderable products when possible, not generic editorial pages.
 - Extract the exact published technical values into specifications.
+- Treat the verified starting points only as pages to investigate. Return a product
+  only when the official sources support it, and continue searching for other relevant
+  products in the same category.
 - Extract country of origin, driver/control gear, efficacy, emergency details,
   LED lifetime/lumen maintenance and finish whenever the official source publishes them.
 - type_compatible and mounting_compatible compare the published product to the requirement.
@@ -447,17 +488,28 @@ Rules:
         "additionalProperties": False,
     }
 
+    input_content: list[dict] = [{"type": "input_text", "text": prompt}]
+    for starting_point in research_starting_points:
+        if urlparse(starting_point).path.lower().endswith(".pdf"):
+            input_content.append(
+                {
+                    "type": "input_file",
+                    "file_url": starting_point,
+                    "detail": "low",
+                }
+            )
+
     response = client.responses.create(
         model=os.getenv("OPENAI_MODEL", "gpt-5.6"),
         reasoning={"effort": "low"},
         tools=[{
             "type": "web_search",
-            "filters": {"allowed_domains": [approved_domain]},
+            "filters": {"allowed_domains": search_domains},
             "search_context_size": "medium",
         }],
         tool_choice="required",
         include=["web_search_call.action.sources"],
-        input=prompt,
+        input=[{"role": "user", "content": input_content}],
         text={
             "format": {
                 "type": "json_schema",
@@ -473,7 +525,9 @@ Rules:
     seen_products: set[str] = set()
     warnings: list[str] = []
     for item in payload.get("matches", []):
-        product_url = _official_url(item.get("product_url"), approved_domain)
+        product_url = _official_url(
+            item.get("product_url"), approved_domain, trusted_asset_domains
+        )
         if not product_url:
             warnings.append("Skipped a result whose product URL was not on the official domain.")
             continue
@@ -490,8 +544,12 @@ Rules:
                 product_name=item["product_name"],
                 product_code=item.get("product_code"),
                 product_url=product_url,
-                datasheet_url=_official_url(item.get("datasheet_url"), approved_domain),
-                image_url=_official_url(item.get("image_url"), approved_domain),
+                datasheet_url=_official_url(
+                    item.get("datasheet_url"), approved_domain, trusted_asset_domains
+                ),
+                image_url=_official_url(
+                    item.get("image_url"), approved_domain, trusted_asset_domains
+                ),
                 description=item["description"],
                 specifications=specifications,
                 score=score,

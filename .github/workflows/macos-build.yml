@@ -36,6 +36,7 @@ jobs:
           pyinstaller --noconfirm --clean --onefile \
             --name tecs-engine \
             --paths services/local_engine/src \
+            --collect-data tecs_engine \
             --collect-all rapidocr \
             --collect-all onnxruntime \
             services/local_engine/sidecar_entry.py

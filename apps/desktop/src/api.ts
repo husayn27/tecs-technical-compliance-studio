@@ -1,4 +1,6 @@
 import type { ComplianceItem, Fixture, LocalAIStatus, Product, ProjectDetails, QuoteLine } from "./types";
+import { isTauri } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-shell";
 
 const BASE_URL = "http://127.0.0.1:8765/api";
 
@@ -100,19 +102,27 @@ export async function downloadCompliance(
   items: ComplianceItem[],
   filename = "TECS-Technical-Compliance",
 ) {
-  const response = await fetch(`${BASE_URL}/compliance/${format}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ project, items }),
-  });
-  if (!response.ok) {
-    const payload = await response.json().catch(() => ({ detail: "Could not create the technical sheets." }));
-    throw new Error(payload.detail || "Could not create the technical sheets.");
+  try {
+    return await parsed<{ saved: boolean; filename: string; path: string }>(
+      await fetch(`${BASE_URL}/compliance/${format}/save?filename=${encodeURIComponent(filename)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ project, items }),
+      }),
+    );
+  } catch (error) {
+    if (error instanceof TypeError) {
+      throw new Error("The local TECS service stopped responding. Restart the application and export again.");
+    }
+    throw error;
   }
-  const blob = await response.blob();
-  const link = document.createElement("a");
-  link.href = URL.createObjectURL(blob);
-  link.download = `${filename}.${format}`;
-  link.click();
-  URL.revokeObjectURL(link.href);
+}
+
+export async function openExternalUrl(url: string) {
+  if (!url) return;
+  if (isTauri()) {
+    await open(url);
+    return;
+  }
+  window.open(url, "_blank", "noopener,noreferrer");
 }
