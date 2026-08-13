@@ -340,6 +340,12 @@ function productFacts(product: Product) {
   ].filter(Boolean) as string[];
 }
 
+function verificationLabel(product: Product) {
+  if (product.verification_level === "datasheet") return "Datasheet verified";
+  if (product.verification_level === "multi_source") return "Multiple official sources";
+  return "Official product page";
+}
+
 export default function App() {
   const [step, setStep] = useState(0);
   const [project, setProject] = useState<ProjectDetails>({ project_name: "", client: "", consultant: "", contractor: "", reference: "" });
@@ -571,10 +577,11 @@ export default function App() {
     const brand = BRANDS.find((candidate) => candidate.name === item.brand) || BRANDS[0];
     setSearching(item.id);
     setError("");
+    setWarnings([]);
     try {
       const response = await searchProducts(itemToFixture(item), brand.name, searchTolerance);
       setSearchResults((current) => ({ ...current, [item.id]: response.matches }));
-      if (!response.matches.length) setError(`No verified ${brand.name} products were returned. Review the requirements or increase the lumen and wattage tolerances.`);
+      if (!response.matches.length) setError(response.warnings[0] || `No verified ${brand.name} products were returned. Review the requirements or increase the lumen and wattage tolerances.`);
       else if (response.warnings.length) setWarnings(response.warnings);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "The product search could not be completed.");
@@ -716,7 +723,7 @@ export default function App() {
               </div>
               {activeItem && <div className="editor-card product-editor">
                 <div className="ai-search-panel">
-                  <div className="search-panel-copy"><div className="ai-icon"><Search size={18} /></div><div><strong>Official {activeItem.brand} product search</strong><span>Only the approved manufacturer domain is searched. Results are scored against the engineer-entered requirement.</span></div></div>
+                  <div className="search-panel-copy"><div className="ai-icon"><Search size={18} /></div><div><strong>Deep official {activeItem.brand} product research</strong><span>The API explores the approved catalog, product finder, order pages, and technical datasheets, then verifies and ranks exact configurations. A thorough search can take a few minutes.</span></div></div>
                   {!apiReady ? <button className="outline api-settings-shortcut" onClick={() => setApiSettingsOpen(true)}><Settings size={16} />Configure API in settings</button> : <div className="search-controls"><label className="tolerance-field"><span>Lumens ±</span><input type="number" min="0" max="100" value={searchTolerance.lumens_percent} onChange={(event) => setSearchTolerance((current) => ({ ...current, lumens_percent: Number(event.target.value) }))} /><small>%</small></label><label className="tolerance-field"><span>Watts ±</span><input type="number" min="0" max="100" value={searchTolerance.wattage_percent} onChange={(event) => setSearchTolerance((current) => ({ ...current, wattage_percent: Number(event.target.value) }))} /><small>%</small></label><button className="primary" disabled={searching === activeItem.id} onClick={() => findBestProducts(activeItem)}>{searching === activeItem.id ? <LoaderCircle className="spin" size={16} /> : <Search size={16} />}Search matching options</button></div>}
                 </div>
                 <div className="product-identity">
@@ -735,7 +742,7 @@ export default function App() {
                     const hasMismatch = product.criteria.some((criterion) => criterion.status === "mismatch");
                     const hasUnknown = product.criteria.some((criterion) => criterion.status === "unknown");
                     return <article className={`api-product ${selectedMatches[activeItem.id] === product.id ? "selected" : ""}`} key={product.id}>
-                      <div className="result-rank">#{index + 1}</div><div className="result-main"><strong>{product.product_name}</strong><span>{product.product_code || "Order code not published"} · {matchSummary(product)}</span><div className="product-facts">{productFacts(product).map((fact) => <small key={fact}>{fact}</small>)}</div><div className="result-links"><button onClick={() => openOfficialLink(product.product_url)}>Official product <ExternalLink size={11} /></button>{product.datasheet_url && <button onClick={() => openOfficialLink(product.datasheet_url!)}>Datasheet <ExternalLink size={11} /></button>}</div></div><div className={`result-score ${product.score >= 80 ? "high" : ""}`}>{product.score}%<small>match</small></div><button className={selectedMatches[activeItem.id] === product.id ? "selected-product" : "select-product"} onClick={() => finalizeProduct(activeItem, product)}>{selectedMatches[activeItem.id] === product.id ? <><Check size={14} />Finalized</> : "Use product"}</button>
+                      <div className="result-rank">#{index + 1}</div><div className="result-main"><strong>{product.product_name}</strong><span>{product.product_code || "Order code not published"} · {matchSummary(product)}</span><div className="verification-row"><span className={`verification-badge ${product.verification_level || "product_page"}`}><ShieldCheck size={11} />{verificationLabel(product)}</span>{(product.evidence_urls?.length || 0) > 0 && <small>{product.evidence_urls!.length} official source{product.evidence_urls!.length === 1 ? "" : "s"} checked</small>}</div><div className="product-facts">{productFacts(product).map((fact) => <small key={fact}>{fact}</small>)}</div><div className="result-links"><button onClick={() => openOfficialLink(product.product_url)}>Official product <ExternalLink size={11} /></button>{product.datasheet_url && <button onClick={() => openOfficialLink(product.datasheet_url!)}>Datasheet <ExternalLink size={11} /></button>}</div></div><div className={`result-score ${product.score >= 80 ? "high" : ""}`}>{product.score}%<small>match</small></div><button className={selectedMatches[activeItem.id] === product.id ? "selected-product" : "select-product"} onClick={() => finalizeProduct(activeItem, product)}>{selectedMatches[activeItem.id] === product.id ? <><Check size={14} />Finalized</> : "Use product"}</button>
                       <div className="commercial-row"><span className={`tolerance-badge ${hasMismatch ? "outside" : hasUnknown ? "verify" : "inside"}`}>{hasMismatch ? "Outside one or more limits" : hasUnknown ? "Within known limits · verify gaps" : "Within selected tolerance"}</span><label><span>Quoted unit price</span><select className="currency-select" value={priceCurrency} onChange={(event) => setPriceCurrency(event.target.value as "OMR" | "AED" | "USD")}><option value="OMR">OMR</option><option value="AED">AED</option><option value="USD">USD</option></select><input type="number" min="0" step="0.001" value={candidatePrices[priceKey] || ""} onChange={(event) => setCandidatePrices((current) => ({ ...current, [priceKey]: event.target.value }))} placeholder="Optional" /></label>{unitPrice > 0 && activeItem.quantity > 0 && <strong>Total: {priceCurrency} {(unitPrice * activeItem.quantity).toLocaleString(undefined, { maximumFractionDigits: 3 })}</strong>}</div>
                       <details className="criteria-details"><summary>View requirement comparison ({product.criteria.length})</summary><div className="criteria-grid"><strong>Category</strong><strong>Required</strong><strong>Offered</strong><strong>Result</strong>{product.criteria.map((criterion) => <div className="criterion-row" key={criterion.criterion}><span>{criterion.criterion}</span><span>{criterion.required}</span><span>{criterion.offered}</span><span className={`criterion-status ${criterion.status}`}>{criterion.status}</span></div>)}</div></details>
                     </article>;

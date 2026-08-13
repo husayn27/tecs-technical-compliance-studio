@@ -7,8 +7,9 @@ import uuid
 from urllib.parse import urlparse
 
 import keyring
-from openai import OpenAI
+from openai import APITimeoutError, OpenAI
 
+from .brand_research import BRAND_RESEARCH_PROFILES
 from .models import (
     CriterionResult,
     ProductMatch,
@@ -19,46 +20,6 @@ from .models import (
 
 KEYRING_SERVICE = "TECS Lighting Quotation"
 KEYRING_USER = "openai-api-key"
-APPROVED_BRANDS = {
-    "Signify": "signify.com",
-    "Modular Lighting": "supermodular.com",
-    "Colour Kinetics": "colorkinetics.com",
-    "Lite Magic": "litemagic.com",
-    "LEDC4": "ledsc4.com",
-    "LuxeLED": "luxeled.com",
-    "Novolux": "novoluxlighting.com",
-    "ATP": "atpiluminacion.com",
-    "Plux B": "pluxb.com",
-    "Floz": "flos.com",
-    "RELCO": "relcogroup.com",
-    "Unilamp": "unilamp.co.th",
-    "Ligman": "ligman.com",
-    "MP Illumination": "mpillumination.com",
-    "Hepper": "heperlighting.com",
-    "Faelluce": "faelluce.lighting",
-    "Dialight": "dialight.com",
-    "Airfal": "airfal.com",
-    "3F Filippi": "3f-filippi.it",
-    "Roger Pradier": "roger-pradier.com",
-    "Francisconi": "francesconi.it",
-    "Whitecroft Lighting": "whitecroftlighting.com",
-}
-
-# Some manufacturers publish their own datasheets on a separately hosted CDN.
-# Keep this allowlist brand-specific and host-specific: generic CDN domains are
-# never trusted for every brand.
-TRUSTED_ASSET_DOMAINS = {
-    "LuxeLED": (
-        "90b00135-5a72-4c01-b37e-1f0325f9da2e.usrfiles.com",
-    ),
-}
-
-VERIFIED_RESEARCH_STARTING_POINTS = {
-    "LuxeLED": (
-        "https://www.luxeled.com/product-page/mellow-iii",
-        "https://90b00135-5a72-4c01-b37e-1f0325f9da2e.usrfiles.com/ugd/90b001_efb17c738c5d441cb8b5034f692dddb0.pdf",
-    ),
-}
 
 
 def _anonymous_requirement(request: ProductSearchRequest) -> dict:
@@ -353,68 +314,13 @@ def _api_key() -> str:
     return key
 
 
-def search_products(request: ProductSearchRequest) -> ProductSearchResponse:
-    approved_domain = APPROVED_BRANDS.get(request.brand)
-    if not approved_domain:
-        raise ValueError("The selected manufacturer is not approved.")
-    trusted_asset_domains = TRUSTED_ASSET_DOMAINS.get(request.brand, ())
-    search_domains = [approved_domain, *trusted_asset_domains]
-    research_starting_points = VERIFIED_RESEARCH_STARTING_POINTS.get(request.brand, ())
-    client = OpenAI(api_key=_api_key())
-    fixture = _anonymous_requirement(request)
-    tolerance = request.tolerances.model_dump(mode="json")
-    prompt = f"""
-Search the official {request.brand} website for all distinct currently published,
-orderable lighting products in the same fitting category as this fixture. Return up
-to fifteen credible category-compatible candidates. Do not return an empty list just
-because an exact wattage, lumen value, or other specification is not visible in the
-first page snippet: inspect the product page and its linked datasheet, and return null
-for genuinely unpublished values. The application performs the final numerical
-tolerance checks locally.
-
-Requirement JSON:
-{json.dumps(fixture, indent=2)}
-
-Permitted tolerances:
-{json.dumps(tolerance, indent=2)}
-
-Verified official research starting points for this manufacturer:
-{json.dumps(research_starting_points, indent=2)}
-
-Rules:
-- Use only official manufacturer product or datasheet pages.
-- Follow datasheet links published on the official product page, including the
-  approved manufacturer CDN domains: {", ".join(trusted_asset_domains) or "none"}.
-- Prefer the official manufacturer product page as product_url and its linked PDF
-  as datasheet_url. A manufacturer-CDN PDF may be used as product_url only when no
-  dedicated official product page is available.
-- Return exact orderable products when possible, not generic editorial pages.
-- Extract the exact published technical values into specifications.
-- Treat the verified starting points only as pages to investigate. Return a product
-  only when the official sources support it, and continue searching for other relevant
-  products in the same category.
-- Extract country of origin, driver/control gear, efficacy, emergency details,
-  LED lifetime/lumen maintenance and finish whenever the official source publishes them.
-- type_compatible and mounting_compatible compare the published product to the requirement.
-- dimensions_compatible, construction_compatible and optical_details_compatible compare every
-  stated requirement with the official published specification. Mounting height describes the
-  project installation position and is context, not a required physical product dimension.
-- controls_compatible means the product
-  natively supports, or is officially documented as compatible with, every required control.
-- Use null whenever an official page does not publish a value. Never infer a value from a
-  family code unless the official product page or datasheet explicitly defines it.
-- Do not invent specifications. Use unknown when the official page does not state a value.
-- Keep different order codes when they represent genuinely different configurations.
-- Do not return the same order code or product page more than once.
-- Return no more than fifteen distinct products.
-""".strip()
-
-    schema = {
+def _product_schema(max_items: int = 15) -> dict:
+    return {
         "type": "object",
         "properties": {
             "matches": {
                 "type": "array",
-                "maxItems": 15,
+                "maxItems": max_items,
                 "items": {
                     "type": "object",
                     "properties": {
@@ -424,6 +330,11 @@ Rules:
                         "product_url": {"type": "string"},
                         "datasheet_url": {"type": ["string", "null"]},
                         "image_url": {"type": ["string", "null"]},
+                        "evidence_urls": {
+                            "type": "array",
+                            "maxItems": 6,
+                            "items": {"type": "string"},
+                        },
                         "description": {"type": "string"},
                         "specifications": {
                             "type": "object",
@@ -452,10 +363,7 @@ Rules:
                                 "led_life": {"type": ["string", "null"]},
                                 "finish": {"type": ["string", "null"]},
                                 "waterproof": {"type": ["boolean", "null"]},
-                                "controls": {
-                                    "type": "array",
-                                    "items": {"type": "string"},
-                                },
+                                "controls": {"type": "array", "items": {"type": "string"}},
                                 "type_compatible": {"type": ["boolean", "null"]},
                                 "mounting_compatible": {"type": ["boolean", "null"]},
                                 "dimensions_compatible": {"type": ["boolean", "null"]},
@@ -464,21 +372,21 @@ Rules:
                                 "controls_compatible": {"type": ["boolean", "null"]},
                             },
                             "required": [
-                                "product_type", "country_of_origin", "mounting", "mounting_height_mm", "wattage", "lumens", "cct",
-                                "cri", "ip_rating", "ik_rating", "ugr", "emergency_hours",
-                                "height_mm", "dimensions", "construction", "optical_details", "voltage", "beam_angle",
-                                "efficacy_lm_w", "control_gear", "emergency_details", "led_life", "finish",
-                                "waterproof", "controls", "type_compatible",
-                                "mounting_compatible", "dimensions_compatible",
-                                "construction_compatible", "optical_details_compatible",
-                                "controls_compatible"
+                                "product_type", "country_of_origin", "mounting", "mounting_height_mm",
+                                "wattage", "lumens", "cct", "cri", "ip_rating", "ik_rating", "ugr",
+                                "emergency_hours", "height_mm", "dimensions", "construction",
+                                "optical_details", "voltage", "beam_angle", "efficacy_lm_w",
+                                "control_gear", "emergency_details", "led_life", "finish", "waterproof",
+                                "controls", "type_compatible", "mounting_compatible",
+                                "dimensions_compatible", "construction_compatible",
+                                "optical_details_compatible", "controls_compatible",
                             ],
                             "additionalProperties": False,
                         },
                     },
                     "required": [
-                        "brand", "product_name", "product_code", "product_url",
-                        "datasheet_url", "image_url", "description", "specifications"
+                        "brand", "product_name", "product_code", "product_url", "datasheet_url",
+                        "image_url", "evidence_urls", "description", "specifications",
                     ],
                     "additionalProperties": False,
                 },
@@ -488,42 +396,241 @@ Rules:
         "additionalProperties": False,
     }
 
-    input_content: list[dict] = [{"type": "input_text", "text": prompt}]
-    for starting_point in research_starting_points:
-        if urlparse(starting_point).path.lower().endswith(".pdf"):
-            input_content.append(
-                {
-                    "type": "input_file",
-                    "file_url": starting_point,
-                    "detail": "low",
-                }
-            )
 
-    response = client.responses.create(
+def _discovery_schema() -> dict:
+    return {
+        "type": "object",
+        "properties": {
+            "candidates": {
+                "type": "array",
+                "maxItems": 24,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "product_name": {"type": "string"},
+                        "product_code": {"type": ["string", "null"]},
+                        "product_url": {"type": "string"},
+                        "datasheet_url": {"type": ["string", "null"]},
+                        "evidence_urls": {
+                            "type": "array",
+                            "maxItems": 6,
+                            "items": {"type": "string"},
+                        },
+                        "publication_status": {
+                            "type": "string",
+                            "enum": ["current", "unknown", "discontinued"],
+                        },
+                    },
+                    "required": [
+                        "product_name", "product_code", "product_url", "datasheet_url",
+                        "evidence_urls", "publication_status",
+                    ],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["candidates"],
+        "additionalProperties": False,
+    }
+
+
+def _valid_official_urls(
+    values: list[str | None], domain: str, trusted_asset_domains: tuple[str, ...]
+) -> list[str]:
+    valid: list[str] = []
+    for value in values:
+        official = _official_url(value, domain, trusted_asset_domains)
+        if official and official not in valid:
+            valid.append(official)
+    return valid
+
+
+def _verification_level(product_url: str, datasheet_url: str | None, evidence: list[str]) -> str:
+    if datasheet_url or any(urlparse(url).path.lower().endswith(".pdf") for url in evidence):
+        return "datasheet"
+    return "multi_source" if len(evidence) >= 2 else "product_page"
+
+
+def _research_client() -> OpenAI:
+    timeout = float(os.getenv("TECS_PRODUCT_SEARCH_TIMEOUT_SECONDS", "150"))
+    return OpenAI(api_key=_api_key(), timeout=timeout, max_retries=0)
+
+
+def search_products(request: ProductSearchRequest) -> ProductSearchResponse:
+    profile = BRAND_RESEARCH_PROFILES.get(request.brand)
+    if not profile:
+        raise ValueError("The selected manufacturer is not approved.")
+    approved_domain = profile.domain
+    trusted_asset_domains = profile.trusted_asset_domains
+    search_domains = [approved_domain, *trusted_asset_domains]
+    client = _research_client()
+    fixture = _anonymous_requirement(request)
+    tolerance = request.tolerances.model_dump(mode="json")
+
+    discovery_prompt = f"""
+Perform a broad first-pass catalog investigation of {profile.official_name}. Find up to
+24 distinct, current or possibly current product configurations in the same functional
+category as the requirement. Search product families, product finders, configuration
+pages, downloads, catalogs, and exact order-code pages. Do not filter candidates out
+because a wattage or lumen value is absent from a search snippet; this pass discovers
+the range and its technical evidence for a second verification pass.
+
+Requirement JSON:
+{json.dumps(fixture, indent=2)}
+
+Official catalog starting pages:
+{json.dumps(profile.catalog_pages, indent=2)}
+
+Manufacturer-specific research instructions:
+{profile.research_notes}
+
+Rules:
+- Use only the official domain and the approved manufacturer document domains.
+- Follow links from catalog/category pages into individual products and downloads.
+- Preserve distinct order codes/configurations. A family page is a lead, not proof of
+  one exact configuration.
+- Mark clearly discontinued products as discontinued; do not silently mix them with
+  the active range.
+- Return evidence URLs actually inspected for each candidate.
+""".strip()
+
+    discovery_response = client.with_options(timeout=min(client.timeout, 90.0)).responses.create(
         model=os.getenv("OPENAI_MODEL", "gpt-5.6"),
-        reasoning={"effort": "low"},
+        reasoning={"effort": "medium"},
         tools=[{
             "type": "web_search",
             "filters": {"allowed_domains": search_domains},
-            "search_context_size": "medium",
+            "search_context_size": "high",
         }],
         tool_choice="required",
         include=["web_search_call.action.sources"],
-        input=[{"role": "user", "content": input_content}],
+        input=discovery_prompt,
         text={
             "format": {
                 "type": "json_schema",
-                "name": "lighting_product_matches",
+                "name": "lighting_catalog_discovery",
                 "strict": True,
-                "schema": schema,
+                "schema": _discovery_schema(),
             }
         },
         store=False,
     )
-    payload = json.loads(response.output_text)
+    discovery_payload = json.loads(discovery_response.output_text)
+    discovered: list[dict] = []
+    discovered_pdfs = list(profile.verified_product_pdfs)
+    for candidate in discovery_payload.get("candidates", []):
+        if candidate.get("publication_status") == "discontinued":
+            continue
+        product_url = _official_url(candidate.get("product_url"), approved_domain, trusted_asset_domains)
+        if not product_url:
+            continue
+        datasheet_url = _official_url(candidate.get("datasheet_url"), approved_domain, trusted_asset_domains)
+        evidence = _valid_official_urls(
+            [*candidate.get("evidence_urls", []), product_url, datasheet_url],
+            approved_domain,
+            trusted_asset_domains,
+        )
+        discovered.append({
+            "product_name": candidate["product_name"],
+            "product_code": candidate.get("product_code"),
+            "product_url": product_url,
+            "datasheet_url": datasheet_url,
+            "evidence_urls": evidence,
+        })
+        for url in evidence:
+            if urlparse(url).path.lower().endswith(".pdf") and url not in discovered_pdfs:
+                discovered_pdfs.append(url)
+
+    verification_prompt = f"""
+Complete a second-pass, evidence-based technical verification for {profile.official_name}.
+Deeply inspect the official product pages, configuration/order tables, linked technical
+downloads, and PDFs for the discovered candidates. Also continue searching the official
+catalog in case the discovery pass missed a better category-compatible option. Return up
+to 15 distinct, current, orderable configurations and extract variant-level specifications.
+
+Requirement JSON:
+{json.dumps(fixture, indent=2)}
+
+Permitted tolerances (ranking is still performed locally):
+{json.dumps(tolerance, indent=2)}
+
+Official catalog starting pages:
+{json.dumps(profile.catalog_pages, indent=2)}
+
+Discovered candidates and evidence:
+{json.dumps(discovered, indent=2)}
+
+Manufacturer-specific research instructions:
+{profile.research_notes}
+
+Verification rules:
+- Every returned option must have an official product page, exact official datasheet,
+  official order table, or another official technical source supporting its identity.
+- Do not copy one family-level value into every configuration. Match wattage, lumens,
+  CCT, optics, controls, emergency, protection, and dimensions to the exact order code.
+- If an exact variant cannot be identified, product_code must be null and uncertain
+  specification fields must be null. Never assemble a fictional order code.
+- Prefer product_url as the exact product/configuration page. Put the technical PDF in
+  datasheet_url and list every official page actually used in evidence_urls.
+- Do not return discontinued/phased-out products unless the current manufacturer page
+  explicitly shows they remain orderable; normally omit them.
+- Return null rather than infer values from unrelated variants, marketing text, images,
+  search snippets, or typical industry values.
+- Extract country of origin, driver/control gear, efficacy, emergency details,
+  LED lifetime/lumen maintenance and finish whenever the official source publishes them.
+- type_compatible and mounting_compatible compare the published product to the requirement.
+- dimensions_compatible, construction_compatible and optical_details_compatible compare every
+  stated requirement with the official published specification. Mounting height describes the
+  project installation position and is context, not a required physical product dimension.
+- controls_compatible means the product
+  natively supports, or is officially documented as compatible with, every required control.
+- Use null whenever an official page does not publish a value. Never infer a value from a
+  family code unless the official product page or datasheet explicitly defines it.
+- Do not invent specifications. Use unknown when the official page does not state a value.
+- Keep different order codes when they represent genuinely different configurations.
+- Do not return the same order code or product page more than once.
+- Return no more than fifteen distinct products.
+""".strip()
+
+    input_content: list[dict] = [{"type": "input_text", "text": verification_prompt}]
+    for pdf_url in discovered_pdfs[:4]:
+        input_content.append({"type": "input_file", "file_url": pdf_url, "detail": "low"})
+
+    verification_timed_out = False
+    try:
+        response = client.responses.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-5.6"),
+            reasoning={"effort": "medium"},
+            tools=[{
+                "type": "web_search",
+                "filters": {"allowed_domains": search_domains},
+                "search_context_size": "high",
+            }],
+            tool_choice="required",
+            include=["web_search_call.action.sources"],
+            input=[{"role": "user", "content": input_content}],
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "lighting_product_matches",
+                    "strict": True,
+                    "schema": _product_schema(),
+                }
+            },
+            store=False,
+        )
+        payload = json.loads(response.output_text)
+    except APITimeoutError:
+        verification_timed_out = True
+        payload = {"matches": []}
     matches: list[ProductMatch] = []
     seen_products: set[str] = set()
     warnings: list[str] = []
+    if verification_timed_out:
+        warnings.append(
+            "The detailed verification pass timed out. No unverified discovery-only "
+            "results were shown; retry the search to complete official-source verification."
+        )
     for item in payload.get("matches", []):
         product_url = _official_url(
             item.get("product_url"), approved_domain, trusted_asset_domains
@@ -535,6 +642,14 @@ Rules:
         if identity in seen_products:
             continue
         seen_products.add(identity)
+        datasheet_url = _official_url(
+            item.get("datasheet_url"), approved_domain, trusted_asset_domains
+        )
+        evidence_urls = _valid_official_urls(
+            [*item.get("evidence_urls", []), product_url, datasheet_url],
+            approved_domain,
+            trusted_asset_domains,
+        )
         specifications = ProductSpecifications(**item["specifications"])
         score, criteria = _score_product(request, specifications)
         matches.append(
@@ -544,13 +659,15 @@ Rules:
                 product_name=item["product_name"],
                 product_code=item.get("product_code"),
                 product_url=product_url,
-                datasheet_url=_official_url(
-                    item.get("datasheet_url"), approved_domain, trusted_asset_domains
-                ),
+                datasheet_url=datasheet_url,
                 image_url=_official_url(
                     item.get("image_url"), approved_domain, trusted_asset_domains
                 ),
                 description=item["description"],
+                evidence_urls=evidence_urls,
+                verification_level=_verification_level(
+                    product_url, datasheet_url, evidence_urls
+                ),
                 specifications=specifications,
                 score=score,
                 criteria=criteria,

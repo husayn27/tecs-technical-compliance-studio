@@ -64,6 +64,8 @@ export type Product = {
   datasheet_url?: string | null;
   image_url?: string | null;
   description: string;
+  evidence_urls?: string[];
+  verification_level?: "datasheet" | "multi_source" | "product_page";
   specifications: {
     product_type?: string | null;
     country_of_origin?: string | null;

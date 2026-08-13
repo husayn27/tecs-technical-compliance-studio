@@ -130,6 +130,8 @@ class ProductMatch(BaseModel):
     datasheet_url: HttpUrl | None = None
     image_url: HttpUrl | None = None
     description: str
+    evidence_urls: list[HttpUrl] = Field(default_factory=list)
+    verification_level: Literal["datasheet", "multi_source", "product_page"] = "product_page"
     specifications: ProductSpecifications = Field(default_factory=ProductSpecifications)
     score: float = Field(ge=0, le=100)
     criteria: list[CriterionResult]

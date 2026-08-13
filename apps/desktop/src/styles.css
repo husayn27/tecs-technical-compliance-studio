@@ -141,6 +141,11 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 .result-main > span { margin-top: 3px; color: #7d8c93; font-size: 8px; }
 .product-facts { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
 .product-facts small { padding: 2px 5px; color: #53636c; border-radius: 4px; background: #eef2f4; font-size: 7px; font-weight: 700; }
+.verification-row { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.verification-row > small { color: #76818c; font-size: 7px; font-weight: 700; }
+.verification-badge { display: inline-flex; align-items: center; gap: 4px; border: 1px solid #cdd6dc; border-radius: 999px; padding: 3px 6px; color: #52606b; background: #f6f8f9; font-size: 7px; font-weight: 800; text-transform: uppercase; letter-spacing: .035em; }
+.verification-badge.datasheet { color: #176a43; border-color: #b9dcc9; background: #eef8f2; }
+.verification-badge.multi_source { color: #365d80; border-color: #c7d8e8; background: #f0f6fb; }
 .result-links { display: flex; gap: 12px; margin-top: 5px; }
 .result-links button { display: inline-flex; align-items: center; gap: 3px; padding: 0; color: #b51c34; border: 0; background: transparent; font-size: 8px; font-weight: 700; text-decoration: none; }
 .result-links button:hover { text-decoration: underline; }

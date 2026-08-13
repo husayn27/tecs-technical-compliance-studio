@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
+from tecs_engine.brand_research import APPROVED_BRANDS, BRAND_RESEARCH_PROFILES
 from tecs_engine.knowledge import match_document_profile
 from tecs_engine.models import (
     FixtureRequirement,
@@ -12,8 +14,14 @@ from tecs_engine.models import (
 )
 from tecs_engine.product_search import (
     _anonymous_requirement,
+    _discovery_schema,
     _official_url,
+    _product_schema,
+    _research_client,
     _score_product,
+    _valid_official_urls,
+    _verification_level,
+    search_products,
 )
 from tecs_engine.storage import KnowledgeStore
 
@@ -216,3 +224,164 @@ def test_brand_specific_official_cdn_urls_are_accepted() -> None:
         "luxeled.com",
         (luxeled_cdn,),
     ) is None
+
+
+def test_every_approved_brand_has_a_deep_research_profile() -> None:
+    assert len(BRAND_RESEARCH_PROFILES) == 22
+    assert set(BRAND_RESEARCH_PROFILES) == set(APPROVED_BRANDS)
+    for brand, profile in BRAND_RESEARCH_PROFILES.items():
+        assert profile.catalog_pages, brand
+        assert profile.research_notes, brand
+        assert all(
+            _official_url(url, profile.domain, profile.trusted_asset_domains)
+            for url in profile.catalog_pages
+        )
+
+
+def test_every_trusted_document_domain_is_scoped_to_its_brand() -> None:
+    luxeled = BRAND_RESEARCH_PROFILES["LuxeLED"]
+    pdf = luxeled.verified_product_pdfs[0]
+    assert _official_url(pdf, luxeled.domain, luxeled.trusted_asset_domains) == pdf
+    for brand, profile in BRAND_RESEARCH_PROFILES.items():
+        if brand != "LuxeLED":
+            assert _official_url(pdf, profile.domain, profile.trusted_asset_domains) is None
+
+
+def test_only_official_evidence_urls_survive_validation() -> None:
+    evidence = _valid_official_urls(
+        [
+            "https://www.signify.com/global/prof",
+            "https://www.signify.com/global/prof",
+            "https://example.com/invented.pdf",
+            None,
+        ],
+        "signify.com",
+        (),
+    )
+    assert evidence == ["https://www.signify.com/global/prof"]
+
+
+def test_verification_level_prefers_datasheet_then_multiple_sources() -> None:
+    assert _verification_level(
+        "https://signify.com/product", "https://signify.com/datasheet.pdf", []
+    ) == "datasheet"
+    assert _verification_level(
+        "https://signify.com/product",
+        None,
+        ["https://signify.com/product", "https://signify.com/configuration"],
+    ) == "multi_source"
+    assert _verification_level(
+        "https://signify.com/product", None, ["https://signify.com/product"]
+    ) == "product_page"
+
+
+def test_deep_search_schemas_require_evidence_for_every_candidate() -> None:
+    discovery = _discovery_schema()["properties"]["candidates"]["items"]
+    products = _product_schema()["properties"]["matches"]["items"]
+    assert "evidence_urls" in discovery["required"]
+    assert "publication_status" in discovery["required"]
+    assert "evidence_urls" in products["required"]
+
+
+def test_research_client_has_a_bounded_timeout(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-api-key-value-long-enough")
+    monkeypatch.setenv("TECS_PRODUCT_SEARCH_TIMEOUT_SECONDS", "42")
+    client = _research_client()
+    assert client.timeout == 42.0
+    assert client.max_retries == 0
+
+
+def test_product_search_runs_discovery_then_exact_verification(monkeypatch) -> None:
+    calls: list[dict] = []
+    discovery = {
+        "candidates": [
+            {
+                "product_name": "Official candidate",
+                "product_code": "CODE-1",
+                "product_url": "https://www.signify.com/global/prof/product-one",
+                "datasheet_url": "https://www.signify.com/api/assets/product-one.pdf",
+                "evidence_urls": ["https://www.signify.com/global/prof/product-one"],
+                "publication_status": "current",
+            }
+        ]
+    }
+    specifications = {
+        "product_type": "pole floodlight",
+        "country_of_origin": None,
+        "mounting": "pole mounted",
+        "mounting_height_mm": None,
+        "wattage": 400,
+        "lumens": 58070,
+        "cct": None,
+        "cri": None,
+        "ip_rating": 66,
+        "ik_rating": None,
+        "ugr": None,
+        "emergency_hours": None,
+        "height_mm": None,
+        "dimensions": None,
+        "construction": None,
+        "optical_details": None,
+        "voltage": None,
+        "beam_angle": None,
+        "efficacy_lm_w": None,
+        "control_gear": None,
+        "emergency_details": None,
+        "led_life": None,
+        "finish": None,
+        "waterproof": None,
+        "controls": [],
+        "type_compatible": True,
+        "mounting_compatible": True,
+        "dimensions_compatible": None,
+        "construction_compatible": None,
+        "optical_details_compatible": None,
+        "controls_compatible": None,
+    }
+    verified = {
+        "matches": [
+            {
+                "brand": "Signify",
+                "product_name": "Verified exact configuration",
+                "product_code": "CODE-1",
+                "product_url": "https://www.signify.com/global/prof/product-one",
+                "datasheet_url": "https://www.signify.com/api/assets/product-one.pdf",
+                "image_url": None,
+                "evidence_urls": [
+                    "https://www.signify.com/global/prof/product-one",
+                    "https://www.signify.com/api/assets/product-one.pdf",
+                ],
+                "description": "Official exact configured product",
+                "specifications": specifications,
+            }
+        ]
+    }
+
+    class FakeResponses:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            payload = discovery if len(calls) == 1 else verified
+            return SimpleNamespace(output_text=json.dumps(payload))
+
+    class FakeClient:
+        timeout = 150.0
+
+        def __init__(self):
+            self.responses = FakeResponses()
+
+        def with_options(self, **_kwargs):
+            return self
+
+    monkeypatch.setattr("tecs_engine.product_search._research_client", FakeClient)
+    request = ProductSearchRequest(fixture=fixture(), brand="Signify")
+
+    response = search_products(request)
+
+    assert len(calls) == 2
+    assert calls[0]["tools"][0]["search_context_size"] == "high"
+    assert calls[1]["tools"][0]["search_context_size"] == "high"
+    verification_content = calls[1]["input"][0]["content"]
+    assert any(item.get("type") == "input_file" for item in verification_content)
+    assert response.matches[0].product_code == "CODE-1"
+    assert response.matches[0].verification_level == "datasheet"
+    assert len(response.matches[0].evidence_urls) == 2
