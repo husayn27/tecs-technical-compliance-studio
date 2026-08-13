@@ -1,6 +1,6 @@
 # TECS Technical Compliance Studio
 
-A desktop workflow for building lighting technical-compliance submissions from engineer-entered requirements or extracted PDF drawings. It compares specified and proposed products and exports one technical data sheet per fitting in Excel or PDF.
+A desktop workflow for building lighting technical-compliance submissions from engineer-entered requirements or extracted PDF drawings. It compares specified and proposed products, maintains a reusable team product catalogue, and exports technical data sheets plus a commercial quotation.
 
 ## API key security
 
@@ -13,11 +13,14 @@ The key is stored locally in that user's operating-system credential store. It i
 1. Enter the project, client, consultant, contractor, and submission reference.
 2. Start manually or extract a first draft from lighting PDF drawings.
 3. Enter the basic lighting-legend details for every fitting type: type, quantity, mounting, wattage, lumens, CCT, CRI, IP/IK, UGR, and controls.
-4. Choose from the 21 approved manufacturers and use the OpenAI Responses API to search only that brand's official domain.
-5. Set the lumen and wattage tolerances, compare up to fifteen distinct official product options with their technical breakdown and quoted prices, finalize one, then verify the populated proposed values and drafted deviation remarks.
-6. Select the products for submission and export individual or combined Excel/PDF technical data sheets.
+4. Choose from the approved manufacturers and browse the saved team catalogue using product-family, mounting, CCT, and control filters.
+5. If the required product is missing or outdated, use the OpenAI Responses API to research that brand's official sources and compare up to five verified options.
+6. Finalize one product, verify the live requirement comparison and deviation remarks, then enter an optional supplier currency and unit price.
+7. Select the products for submission, choose the export folder, and create individual or combined Excel/PDF technical data sheets plus the commercial Excel quotation.
 
 Excel compliance exports are generated from the supplied TECS technical-compliance workbook itself. Each selected product duplicates the native item page and preserves its logo, merged cells, five-column layout, fonts, borders, row heights, column widths, and print settings.
+
+Commercial exports use the supplied TECS costing workbook, preserve its calculation structure, and populate the project details, selected products, currencies, supplier prices, quantities, and user-configured exchange rates. Export filenames use the project reference, project name, and client. The selected export folder is remembered locally until the user changes it.
 
 Drawing extraction runs locally. Product search sends only normalized fixture criteria and the selected manufacturer domain to the OpenAI Responses API.
 
@@ -50,10 +53,20 @@ The first development launch downloads roughly 5 GB of model files into the loca
 
 Both release builds package the local Python extraction/OCR service as a private sidecar. The user does not install Python, Node.js, OCR tools, or a database.
 
-- Run the `Windows installer` GitHub Actions workflow for a normal NSIS `.exe` installer.
+- Push a version tag such as `v0.1.3` to build a normal NSIS `.exe` installer and attach it permanently to a GitHub Release.
+- The `Windows installer` workflow can also be started manually for an internal test build; manual builds appear as temporary GitHub Actions artifacts.
 - Run the `macOS application` workflow for a drag-and-drop `.dmg` containing the `.app`.
 
 Public distribution should use a Windows code-signing certificate and an Apple Developer ID certificate with notarisation. Unsigned installers can still be tested internally but may display Windows SmartScreen or macOS Gatekeeper warnings.
+
+### Windows installation from GitHub
+
+1. Open the repository's **Releases** page.
+2. Open the newest release and download the `.exe` listed under **Assets**.
+3. Run the installer. Until the app is code-signed, Windows may show **Windows protected your PC**; use **More info** and **Run anyway** only when the installer came from the official TECS repository.
+4. Open **API settings** and enter the user's own OpenAI API key. No OpenAI key is bundled with the application.
+
+The shared Supabase catalogue contains reusable manufacturer product details only. It does not contain project names, customer files, commercial prices, exported documents, or OpenAI keys. Its publishable client key is intentionally distributable; never substitute a Supabase secret or `service_role` key in the application.
 
 ## Repository layout
 

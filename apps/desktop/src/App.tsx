@@ -14,17 +14,20 @@ import {
   KeyRound,
   Minus,
   Plus,
+  RefreshCw,
   Search,
   Save,
   Settings,
+  Users,
   ShieldCheck,
   Trash2,
   UploadCloud,
+  X,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
-import { approveFixtures, downloadCompliance, extract, health, openExternalUrl, removeApiKey, saveApiKey, searchProducts } from "./api";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { approveFixtures, browseCatalog, catalogSearchStatus, catalogStatus, chooseExportFolder, downloadCommercial, downloadCompliance, extract, getExportFolder, health, openExternalUrl, removeApiKey, saveApiKey, searchProducts, syncTeamCatalog, teamCatalogStatus } from "./api";
 import tecsLogo from "./assets/tecs-logo.png";
-import type { ComplianceItem, ComplianceRow, ComplianceStatus, Fixture, LegendRequirements, LocalAIStatus, Product, ProjectDetails } from "./types";
+import type { CatalogBrowseResponse, CatalogStatus, ComplianceItem, ComplianceRow, ComplianceStatus, Currency, Fixture, LegendRequirements, LocalAIStatus, Product, ProductSearchResponse, ProjectDetails, TeamCatalogStatus } from "./types";
 
 const BRANDS = [
   { name: "Signify", domain: "signify.com" },
@@ -51,8 +54,51 @@ const BRANDS = [
   { name: "Whitecroft Lighting", domain: "whitecroftlighting.com" },
 ];
 
-const UI_ZOOM_KEY = "tecs-ui-zoom";
+const BRAND_ALIASES: Record<string, string> = {
+  signify: "Signify",
+  philips: "Signify",
+  "philips lighting": "Signify",
+  "signify / philips": "Signify",
+  "signify/philips": "Signify",
+};
 
+function canonicalBrand(value: string) {
+  const cleaned = (value || "").trim().replace(/\s+/g, " ");
+  return BRAND_ALIASES[cleaned.toLowerCase()] || cleaned;
+}
+
+function normalizeItemBrand(item: ComplianceItem): ComplianceItem {
+  const brand = canonicalBrand(item.brand);
+  if (brand === item.brand) return item;
+  return {
+    ...item,
+    brand,
+    rows: item.rows.map((row) => row.parameter === "Make"
+      ? { ...row, proposed: canonicalBrand(row.proposed) }
+      : row),
+  };
+}
+const CURRENCIES: Currency[] = ["OMR", "AED", "USD", "GBP", "EUR"];
+type ExchangeRateSets = Record<Currency, Partial<Record<Currency, number>>>;
+type CatalogFilters = {
+  family: string;
+  mounting: string;
+  cct: string;
+  control: string;
+};
+
+const DEFAULT_CATALOG_FILTERS: CatalogFilters = {
+  family: "All families",
+  mounting: "All mounting types",
+  cct: "All CCTs",
+  control: "All controls",
+};
+
+function defaultExchangeRates(): ExchangeRateSets {
+  return Object.fromEntries(CURRENCIES.map((offerCurrency) => [offerCurrency, { [offerCurrency]: 1 }])) as ExchangeRateSets;
+}
+
+const UI_ZOOM_KEY = "tecs-ui-zoom";
 const PARAMETERS = [
   "Description",
   "Make",
@@ -75,6 +121,59 @@ const PARAMETERS = [
 
 const STEPS = ["Project", "Requirements", "Offered products", "Technical sheets"];
 const STORAGE_KEY = "tecs-compliance-draft-v2";
+const RECENT_PROJECTS_KEY = "tecs-compliance-recent-projects-v1";
+
+type SavedDraft = {
+  project: ProjectDetails;
+  items: ComplianceItem[];
+  activeId: string;
+  priceCurrency: Currency;
+  exchangeRateSets: ExchangeRateSets;
+  catalogFilters: Record<string, CatalogFilters>;
+  catalogViews: Record<string, "closed" | "saved" | "api">;
+  selectedMatches: Record<string, string>;
+  searchResults: Record<string, Product[]>;
+  candidatePrices: Record<string, string>;
+  candidateCurrencies: Record<string, Currency>;
+  lastExportAt: string | null;
+};
+
+type RecentProject = {
+  id: string;
+  projectName: string;
+  client: string;
+  reference: string;
+  completedAt: string;
+  draft: SavedDraft;
+};
+
+function emptyProject(): ProjectDetails {
+  return { project_name: "", client: "", consultant: "", contractor: "", reference: "" };
+}
+
+function savedRecentProjects(): RecentProject[] {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(RECENT_PROJECTS_KEY) || "[]");
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function filenamePart(value: string) {
+  return value.trim().replace(/[<>:"/\\|?*\u0000-\u001f]+/g, "-").replace(/\s+/g, " ").replace(/[ .-]+$/g, "");
+}
+
+function projectExportName(project: ProjectDetails, documentType: string) {
+  const identity = [project.reference, project.project_name, project.client]
+    .map((value) => filenamePart(value).slice(0, 28).trim())
+    .filter(Boolean);
+  return [...identity, documentType].join(" - ") || `TECS - ${documentType}`;
+}
+
+function recentProjectTitle(recent: RecentProject) {
+  return [recent.reference, recent.projectName].filter(Boolean).join(" — ") || "Untitled project";
+}
 
 function emptyRows(): ComplianceRow[] {
   return PARAMETERS.map((parameter) => ({ parameter, specified: "", proposed: "", status: "pending", remarks: "" }));
@@ -119,6 +218,8 @@ function blankItem(index: number): ComplianceItem {
     model_no: "",
     product_url: "",
     datasheet_url: "",
+    unit_price: null,
+    unit_price_currency: null,
     legend,
     rows,
   };
@@ -270,9 +371,10 @@ function formatLamp(product: Product) {
 
 function applyProduct(item: ComplianceItem, product: Product): ComplianceItem {
   const specs = product.specifications;
+  const brand = canonicalBrand(product.brand);
   const proposed: Record<string, string> = {
     Description: product.description,
-    Make: product.brand,
+    Make: brand,
     "Country of Origin": specs.country_of_origin || "",
     "Model No": product.product_code || "",
     Mounting: specs.mounting || "",
@@ -301,7 +403,7 @@ function applyProduct(item: ComplianceItem, product: Product): ComplianceItem {
   };
   return {
     ...item,
-    brand: product.brand,
+    brand,
     product_name: product.product_name,
     country_of_origin: specs.country_of_origin || "",
     model_no: product.product_code || "",
@@ -346,9 +448,15 @@ function verificationLabel(product: Product) {
   return "Official product page";
 }
 
+function displayManufacturerDate(value?: string | null) {
+  if (!value) return "Not published";
+  const parsed = new Date(value.length === 10 ? `${value}T00:00:00` : value);
+  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleDateString();
+}
+
 export default function App() {
   const [step, setStep] = useState(0);
-  const [project, setProject] = useState<ProjectDetails>({ project_name: "", client: "", consultant: "", contractor: "", reference: "" });
+  const [project, setProject] = useState<ProjectDetails>(emptyProject);
   const [projectId, setProjectId] = useState("");
   const [files, setFiles] = useState<File[]>([]);
   const [sourceFixtures, setSourceFixtures] = useState<Fixture[]>([]);
@@ -360,16 +468,34 @@ export default function App() {
   const [success, setSuccess] = useState("");
   const [localAI, setLocalAI] = useState<LocalAIStatus | null>(null);
   const [serviceStatus, setServiceStatus] = useState<"checking" | "ready" | "offline">("checking");
+  const [catalogApiReady, setCatalogApiReady] = useState(false);
   const [apiReady, setApiReady] = useState(false);
   const [apiKey, setApiKey] = useState("");
   const [apiSettingsOpen, setApiSettingsOpen] = useState(false);
   const [apiSettingsMessage, setApiSettingsMessage] = useState("");
+  const [settingsTab, setSettingsTab] = useState<"api" | "team">("api");
+  const [teamCatalog, setTeamCatalog] = useState<TeamCatalogStatus | null>(null);
+  const [teamMessage, setTeamMessage] = useState("");
   const [searching, setSearching] = useState("");
   const [searchResults, setSearchResults] = useState<Record<string, Product[]>>({});
+  const [catalogBrowseInfo, setCatalogBrowseInfo] = useState<Record<string, CatalogBrowseResponse>>({});
+  const [catalogFilters, setCatalogFilters] = useState<Record<string, CatalogFilters>>({});
+  const [catalogViews, setCatalogViews] = useState<Record<string, "closed" | "saved" | "api">>({});
+  const [browsingCatalog, setBrowsingCatalog] = useState("");
   const [selectedMatches, setSelectedMatches] = useState<Record<string, string>>({});
+  const [failedSearches, setFailedSearches] = useState<Record<string, boolean>>({});
+  const [catalogInfo, setCatalogInfo] = useState<CatalogStatus | null>(null);
+  const [searchInfo, setSearchInfo] = useState<Record<string, ProductSearchResponse>>({});
+  const [refreshingCatalogs, setRefreshingCatalogs] = useState<Record<string, boolean>>({});
+  const catalogPolls = useRef(new Set<string>());
   const [searchTolerance, setSearchTolerance] = useState({ lumens_percent: 10, wattage_percent: 15 });
   const [candidatePrices, setCandidatePrices] = useState<Record<string, string>>({});
-  const [priceCurrency, setPriceCurrency] = useState<"OMR" | "AED" | "USD">("OMR");
+  const [candidateCurrencies, setCandidateCurrencies] = useState<Record<string, Currency>>({});
+  const [priceCurrency, setPriceCurrency] = useState<Currency>("OMR");
+  const [exchangeRateSets, setExchangeRateSets] = useState<ExchangeRateSets>(defaultExchangeRates);
+  const [lastExportAt, setLastExportAt] = useState<string | null>(null);
+  const [recentProjects, setRecentProjects] = useState<RecentProject[]>(savedRecentProjects);
+  const [exportFolder, setExportFolder] = useState("");
   const [restored, setRestored] = useState(false);
   const [uiZoom, setUiZoom] = useState(() => {
     const saved = Number(localStorage.getItem(UI_ZOOM_KEY));
@@ -382,8 +508,17 @@ export default function App() {
       if (raw) {
         const draft = JSON.parse(raw);
         if (draft.project) setProject(draft.project);
-        if (Array.isArray(draft.items)) setItems(draft.items);
+        if (Array.isArray(draft.items)) setItems(draft.items.map(normalizeItemBrand));
         if (draft.activeId) setActiveId(draft.activeId);
+        if (draft.catalogFilters) setCatalogFilters(draft.catalogFilters);
+        if (draft.catalogViews) setCatalogViews(draft.catalogViews);
+        if (draft.selectedMatches) setSelectedMatches(draft.selectedMatches);
+        if (draft.searchResults) setSearchResults(draft.searchResults);
+        if (draft.candidatePrices) setCandidatePrices(draft.candidatePrices);
+        if (draft.candidateCurrencies) setCandidateCurrencies(draft.candidateCurrencies);
+        if (draft.lastExportAt) setLastExportAt(draft.lastExportAt);
+        if (["OMR", "AED", "USD", "GBP", "EUR"].includes(draft.priceCurrency)) setPriceCurrency(draft.priceCurrency as Currency);
+        if (draft.exchangeRateSets) setExchangeRateSets({ ...defaultExchangeRates(), ...draft.exchangeRateSets });
       }
     } catch {
       localStorage.removeItem(STORAGE_KEY);
@@ -399,6 +534,10 @@ export default function App() {
         setLocalAI(value.local_ai);
         setApiReady(value.api_key_configured);
         setServiceStatus("ready");
+        setCatalogApiReady(value.catalog_api === true);
+        if (value.catalog_api === true) void catalogStatus().then(setCatalogInfo).catch(() => undefined);
+        void teamCatalogStatus().then(setTeamCatalog).catch(() => undefined);
+        void getExportFolder().then((folder) => setExportFolder(folder.path)).catch(() => undefined);
       } catch {
         if (cancelled) return;
         attempts += 1;
@@ -421,11 +560,42 @@ export default function App() {
 
   useEffect(() => {
     if (!restored) return;
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ project, items, activeId }));
-  }, [project, items, activeId, restored]);
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ project, items, activeId, priceCurrency, exchangeRateSets, catalogFilters, catalogViews, selectedMatches, searchResults, candidatePrices, candidateCurrencies, lastExportAt }));
+  }, [project, items, activeId, priceCurrency, exchangeRateSets, catalogFilters, catalogViews, selectedMatches, searchResults, candidatePrices, candidateCurrencies, lastExportAt, restored]);
 
   const activeItem = items.find((item) => item.id === activeId) || items[0];
   const selectedItems = items.filter((item) => item.selected);
+  const activeCatalog = activeItem ? catalogBrowseInfo[activeItem.id] : undefined;
+  const catalogView = activeItem ? catalogViews[activeItem.id] || "closed" : "closed";
+  const activeCatalogFilters = activeItem ? catalogFilters[activeItem.id] || DEFAULT_CATALOG_FILTERS : DEFAULT_CATALOG_FILTERS;
+  const catalogOptions = useMemo(() => {
+    const products = activeCatalog?.products || [];
+    const unique = (values: Array<string | null | undefined>) => [...new Set(values.filter((value): value is string => Boolean(value?.trim())).map((value) => value.trim()))].sort((left, right) => left.localeCompare(right, undefined, { numeric: true }));
+    return {
+      families: activeCatalog?.facets?.families || activeCatalog?.families || [],
+      mounting: activeCatalog?.facets?.mounting || unique(products.map((product) => product.specifications.mounting)),
+      cct: activeCatalog?.facets?.cct || [...new Set(products.map((product) => product.specifications.cct).filter((value): value is number => value != null))].sort((left, right) => left - right),
+      controls: activeCatalog?.facets?.controls || unique(products.flatMap((product) => [product.specifications.control_gear, ...(product.specifications.controls || [])])),
+    };
+  }, [activeCatalog]);
+  const catalogFilterActive = activeCatalogFilters.family !== "All families" || activeCatalogFilters.mounting !== "All mounting types" || activeCatalogFilters.cct !== "All CCTs" || activeCatalogFilters.control !== "All controls";
+  const filteredCatalogProducts = useMemo(() => {
+    if (!activeItem) return [];
+    const products = catalogView === "api" ? (searchResults[activeItem.id] || []) : (activeCatalog?.products || []);
+    if (catalogView === "api") return products;
+    if (catalogView === "saved" && !catalogFilterActive) return [];
+    const filtered = products.filter((product) => {
+      const matchesFamily = activeCatalogFilters.family === "All families" || product.catalog_family === activeCatalogFilters.family;
+      const matchesMounting = activeCatalogFilters.mounting === "All mounting types" || product.specifications.mounting === activeCatalogFilters.mounting;
+      const matchesCct = activeCatalogFilters.cct === "All CCTs" || product.specifications.cct === Number(activeCatalogFilters.cct);
+      const productControls = [product.specifications.control_gear, ...(product.specifications.controls || [])].filter(Boolean);
+      const matchesControl = activeCatalogFilters.control === "All controls" || productControls.includes(activeCatalogFilters.control);
+      return matchesFamily && matchesMounting && matchesCct && matchesControl;
+    });
+    return catalogView === "saved"
+      ? [...filtered].sort((left, right) => left.product_name.localeCompare(right.product_name))
+      : filtered;
+  }, [activeCatalog, activeCatalogFilters, activeItem, catalogFilterActive, catalogView, searchResults]);
   const totals = useMemo(() => {
     const rows = items.flatMap((item) => item.rows);
     return {
@@ -435,8 +605,28 @@ export default function App() {
     };
   }, [items]);
 
+  useEffect(() => {
+    if (step !== 2 || !catalogApiReady || !activeItem || catalogBrowseInfo[activeItem.id] || browsingCatalog === activeItem.id) return;
+    void loadSavedCatalog(activeItem);
+  }, [step, catalogApiReady, activeItem?.id, activeItem?.brand]);
+
   function updateProject(key: keyof ProjectDetails, value: string) {
     setProject((current) => ({ ...current, [key]: value }));
+  }
+
+  function setItemCatalogView(id: string, view: "closed" | "saved" | "api") {
+    setCatalogViews((current) => ({ ...current, [id]: view }));
+  }
+
+  function updateCatalogFilter(id: string, key: keyof CatalogFilters, value: string) {
+    setCatalogFilters((current) => ({
+      ...current,
+      [id]: { ...(current[id] || DEFAULT_CATALOG_FILTERS), [key]: value },
+    }));
+  }
+
+  function resetCatalogFilters(id: string) {
+    setCatalogFilters((current) => ({ ...current, [id]: { ...DEFAULT_CATALOG_FILTERS } }));
   }
 
   function updateItem(id: string, updater: (item: ComplianceItem) => ComplianceItem) {
@@ -500,10 +690,35 @@ export default function App() {
       try { await approveFixtures(projectId, sourceFixtures); } catch { /* Manual compliance work can continue if learning is unavailable. */ }
     }
     setStep(2);
+    const item = activeItem || items[0];
+    if (item) void loadSavedCatalog(item);
+  }
+
+  async function loadSavedCatalog(item: ComplianceItem, brandName = item.brand) {
+    if (!catalogApiReady) return;
+    brandName = canonicalBrand(brandName);
+    setBrowsingCatalog(item.id);
+    setError("");
+    try {
+      const response = await browseCatalog(itemToFixture(item), brandName, searchTolerance);
+      setCatalogBrowseInfo((current) => ({ ...current, [item.id]: response }));
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not load the saved catalogue.");
+    } finally {
+      setBrowsingCatalog("");
+    }
   }
 
   function updateIdentity(id: string, key: "brand" | "country_of_origin" | "model_no" | "product_name", value: string) {
     if (key === "brand") {
+      value = canonicalBrand(value);
+      setItemCatalogView(id, "closed");
+      resetCatalogFilters(id);
+      setCatalogBrowseInfo((current) => {
+        const next = { ...current };
+        delete next[id];
+        return next;
+      });
       setSearchResults((current) => ({ ...current, [id]: [] }));
       setSelectedMatches((current) => ({ ...current, [id]: "" }));
       updateItem(id, (item) => ({
@@ -518,6 +733,8 @@ export default function App() {
           ? { ...row, proposed: value, status: "complies", remarks: "" }
           : { ...row, proposed: "", status: "pending", remarks: "" }),
       }));
+      const current = items.find((item) => item.id === id);
+      if (current) void loadSavedCatalog({ ...current, brand: value }, value);
       return;
     }
     if (key === "product_name") {
@@ -573,26 +790,180 @@ export default function App() {
     }
   }
 
+  async function syncSharedCatalog() {
+    setBusy(true); setTeamMessage("");
+    try {
+      const response = await syncTeamCatalog();
+      setTeamMessage(`Sync complete: ${response.downloaded} downloaded, ${response.uploaded} uploaded.`);
+      setTeamCatalog(await teamCatalogStatus());
+      setCatalogInfo(await catalogStatus());
+      if (activeItem) await loadSavedCatalog(activeItem);
+    } catch (caught) { setTeamMessage(caught instanceof Error ? caught.message : "Team catalogue sync failed."); }
+    finally { setBusy(false); }
+  }
+
+
   async function findBestProducts(item: ComplianceItem) {
-    const brand = BRANDS.find((candidate) => candidate.name === item.brand) || BRANDS[0];
+    if (!catalogApiReady) {
+      setError("The catalogue engine has not restarted yet. Stop and restart the TECS app, then search again; no API search was started.");
+      return;
+    }
+    const itemBrand = canonicalBrand(item.brand);
+    const brand = BRANDS.find((candidate) => candidate.name === itemBrand) || BRANDS[0];
     setSearching(item.id);
     setError("");
     setWarnings([]);
+    setSearchResults((current) => ({ ...current, [item.id]: [] }));
+    setSelectedMatches((current) => ({ ...current, [item.id]: "" }));
+    setFailedSearches((current) => ({ ...current, [item.id]: false }));
     try {
-      const response = await searchProducts(itemToFixture(item), brand.name, searchTolerance);
+      const response = await searchProducts(itemToFixture(item), brand.name, searchTolerance, true);
       setSearchResults((current) => ({ ...current, [item.id]: response.matches }));
-      if (!response.matches.length) setError(response.warnings[0] || `No verified ${brand.name} products were returned. Review the requirements or increase the lumen and wattage tolerances.`);
-      else if (response.warnings.length) setWarnings(response.warnings);
+      setItemCatalogView(item.id, "api");
+      setSearchInfo((current) => ({ ...current, [item.id]: response }));
+      setRefreshingCatalogs((current) => ({ ...current, [item.id]: response.refreshing }));
+      void catalogStatus().then(setCatalogInfo).catch(() => undefined);
+      await loadSavedCatalog(item, brand.name);
+      if (response.refreshing) void pollCatalog(item, brand.name);
+      if (!response.matches.length && !response.refreshing) {
+        setFailedSearches((current) => ({ ...current, [item.id]: true }));
+        setWarnings(response.warnings.length ? response.warnings : [`No verified ${brand.name} options are catalogued for this category yet. You can continue working and retry the background refresh later.`]);
+      } else if (response.warnings.length) setWarnings(response.warnings);
     } catch (caught) {
+      setFailedSearches((current) => ({ ...current, [item.id]: true }));
       setError(caught instanceof Error ? caught.message : "The product search could not be completed.");
     } finally {
       setSearching("");
     }
   }
 
+  async function pollCatalog(item: ComplianceItem, brandName: string) {
+    brandName = canonicalBrand(brandName);
+    if (catalogPolls.current.has(item.id)) return;
+    catalogPolls.current.add(item.id);
+    const startedAt = Date.now();
+    try {
+      let scopeStatus;
+      do {
+        await new Promise((resolve) => window.setTimeout(resolve, 3000));
+        scopeStatus = await catalogSearchStatus(itemToFixture(item), brandName);
+      } while (scopeStatus.refreshing && Date.now() - startedAt < 5 * 60 * 1000);
+      const response = await searchProducts(itemToFixture(item), brandName, searchTolerance);
+      setSearchResults((current) => ({ ...current, [item.id]: response.matches }));
+      setItemCatalogView(item.id, "api");
+      setSearchInfo((current) => ({ ...current, [item.id]: response }));
+      setRefreshingCatalogs((current) => ({ ...current, [item.id]: response.refreshing }));
+      setWarnings(response.warnings);
+      void catalogStatus().then(setCatalogInfo).catch(() => undefined);
+      await loadSavedCatalog(item, brandName);
+      if (!response.matches.length && !response.refreshing) {
+        setFailedSearches((current) => ({ ...current, [item.id]: true }));
+        setWarnings(response.warnings.length ? response.warnings : [`No verified ${brandName} options are catalogued for this category yet. Retry the background refresh later.`]);
+      }
+    } catch (caught) {
+      setWarnings([caught instanceof Error ? `Catalogue status check paused: ${caught.message}` : "Catalogue status check paused. You can retry it later."]);
+    } finally {
+      setRefreshingCatalogs((current) => ({ ...current, [item.id]: false }));
+      catalogPolls.current.delete(item.id);
+    }
+  }
+
   function finalizeProduct(item: ComplianceItem, product: Product) {
-    updateItem(item.id, (current) => applyProduct(current, product));
+    const enteredPrice = candidatePrices[`${item.id}:${product.id}`]?.trim() || "";
+    const unitPrice = enteredPrice === "" ? null : Number(enteredPrice);
+    const unitPriceCurrency = unitPrice == null ? null : candidateCurrencies[`${item.id}:${product.id}`] || item.unit_price_currency || priceCurrency;
+    updateItem(item.id, (current) => ({
+      ...applyProduct(current, product),
+      unit_price: unitPrice != null && Number.isFinite(unitPrice) ? unitPrice : null,
+      unit_price_currency: unitPrice != null && Number.isFinite(unitPrice) ? unitPriceCurrency : null,
+    }));
     setSelectedMatches((current) => ({ ...current, [item.id]: product.id }));
+  }
+
+  function currentDraft(): SavedDraft {
+    return { project, items, activeId, priceCurrency, exchangeRateSets, catalogFilters, catalogViews, selectedMatches, searchResults, candidatePrices, candidateCurrencies, lastExportAt };
+  }
+
+  function restoreProject(draft: SavedDraft) {
+    setProject(draft.project || emptyProject());
+    setItems((draft.items || []).map(normalizeItemBrand));
+    setActiveId(draft.activeId || draft.items?.[0]?.id || "");
+    setPriceCurrency(draft.priceCurrency || "OMR");
+    setExchangeRateSets({ ...defaultExchangeRates(), ...(draft.exchangeRateSets || {}) });
+    setCatalogFilters(draft.catalogFilters || {});
+    setCatalogViews(draft.catalogViews || {});
+    setSelectedMatches(draft.selectedMatches || {});
+    setSearchResults(draft.searchResults || {});
+    setCandidatePrices(draft.candidatePrices || {});
+    setCandidateCurrencies(draft.candidateCurrencies || {});
+    setLastExportAt(draft.lastExportAt || null);
+    setCatalogBrowseInfo({});
+    setSearchInfo({});
+    setWarnings([]);
+    setError("");
+    setSuccess("");
+    setStep(draft.items?.length ? 3 : 0);
+  }
+
+  function finishProjectAndStartNew() {
+    if (!lastExportAt || !project.project_name.trim()) return;
+    const completedAt = new Date().toISOString();
+    const archive: RecentProject = {
+      id: crypto.randomUUID(),
+      projectName: project.project_name.trim(),
+      client: project.client.trim(),
+      reference: project.reference.trim(),
+      completedAt,
+      // Finalized product details live in `items`; transient catalogue cards can
+      // be reloaded from the database and would make the local archive needlessly large.
+      draft: { ...currentDraft(), catalogViews: {}, selectedMatches: {}, searchResults: {}, candidatePrices: {}, candidateCurrencies: {}, lastExportAt },
+    };
+    const nextRecent = [archive, ...recentProjects].slice(0, 12);
+    localStorage.setItem(RECENT_PROJECTS_KEY, JSON.stringify(nextRecent));
+    localStorage.removeItem(STORAGE_KEY);
+    setRecentProjects(nextRecent);
+    setStep(0);
+    setProject(emptyProject());
+    setProjectId("");
+    setFiles([]);
+    setSourceFixtures([]);
+    setItems([]);
+    setActiveId("");
+    setCatalogBrowseInfo({});
+    setCatalogFilters({});
+    setCatalogViews({});
+    setSearchResults({});
+    setSelectedMatches({});
+    setCandidatePrices({});
+    setCandidateCurrencies({});
+    setSearchInfo({});
+    setRefreshingCatalogs({});
+    setFailedSearches({});
+    setExchangeRateSets(defaultExchangeRates());
+    setPriceCurrency("OMR");
+    setLastExportAt(null);
+    setWarnings([]);
+    setError("");
+    setSuccess("Previous project archived. A new blank project is ready.");
+  }
+
+  async function selectExportFolder() {
+    setBusy(true);
+    setError("");
+    try {
+      await health();
+      const result = await chooseExportFolder();
+      setExportFolder(result.path);
+      if (result.selected) setSuccess(`Exports will now be saved to ${result.path}`);
+    } catch (caught) {
+      const message = caught instanceof Error ? caught.message : "";
+      if (caught instanceof TypeError) setServiceStatus("offline");
+      setError(caught instanceof TypeError || /not found/i.test(message)
+        ? "The local TECS engine needs to be restarted for folder selection. Close TECS, run “Run TECS Lighting.command” again, then choose the folder."
+        : message || "Could not select the export folder.");
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function exportSheets(format: "xlsx" | "pdf", only?: ComplianceItem) {
@@ -601,11 +972,27 @@ export default function App() {
     setSuccess("");
     try {
       const exportItems = only ? [{ ...only, selected: true }] : items;
-      const suffix = only ? `${only.fitting_type.replace(/[^a-z0-9]+/gi, "-")}-Technical-Compliance` : "TECS-Technical-Compliance";
+      const suffix = projectExportName(project, only ? "Individual Technical Compliance" : "Technical Compliance");
       const result = await downloadCompliance(format, project, exportItems, suffix);
+      setLastExportAt(new Date().toISOString());
       setSuccess(`Saved ${result.filename} to ${result.path}`);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Could not create the technical sheets.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function exportCommercialQuotation() {
+    setBusy(true);
+    setError("");
+    setSuccess("");
+    try {
+      const result = await downloadCommercial(project, selectedItems, priceCurrency, exchangeRateSets[priceCurrency], projectExportName(project, "Commercial Quotation"));
+      setLastExportAt(new Date().toISOString());
+      setSuccess(`Saved ${result.filename} to ${result.path}`);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not create the commercial quotation.");
     } finally {
       setBusy(false);
     }
@@ -640,7 +1027,7 @@ export default function App() {
           <div><span className="eyebrow">TECS LIGHTING</span><h1>{STEPS[step]}</h1></div>
           <div className="top-statuses"><div className="zoom-controls" aria-label="Interface zoom"><button disabled={uiZoom <= 80} onClick={() => setUiZoom((value) => Math.max(80, value - 10))} title="Make interface smaller"><Minus size={13} /></button><button className="zoom-value" onClick={() => setUiZoom(100)} title="Reset interface size">{uiZoom}%</button><button disabled={uiZoom >= 150} onClick={() => setUiZoom((value) => Math.min(150, value + 10))} title="Make interface larger"><Plus size={13} /></button></div><div className={`engine-chip ${localAI?.available ? "ready" : ""}`}><ShieldCheck size={14} />{localAI?.available ? "Drawing AI ready" : "Manual mode ready"}</div><button className={`engine-chip api-settings-trigger ${apiReady ? "ready" : ""} ${serviceStatus === "offline" ? "offline" : ""}`} onClick={() => { setApiSettingsMessage(serviceStatus === "offline" ? "The local TECS service is not running. Restart the application, then try again." : ""); setApiSettingsOpen(true); }}><Settings size={14} />{serviceStatus === "checking" ? "Connecting to local service…" : serviceStatus === "offline" ? "Local service offline" : apiReady ? "API settings" : "Set up product API"}</button></div>
         </header>
-        {apiSettingsOpen && <div className="settings-overlay" onMouseDown={(event) => event.target === event.currentTarget && setApiSettingsOpen(false)}><section className="settings-panel" role="dialog" aria-modal="true" aria-labelledby="api-settings-title"><div className="settings-header"><div className="settings-icon"><KeyRound size={20} /></div><div><span className="section-kicker">PRODUCT SEARCH</span><h2 id="api-settings-title">OpenAI API settings</h2></div><button className="settings-close" onClick={() => setApiSettingsOpen(false)} aria-label="Close settings">×</button></div><p className="settings-description">The key is stored securely on this computer and is used only for official manufacturer product searches.</p><div className={`api-key-status ${serviceStatus === "offline" ? "offline" : apiReady ? "configured" : "missing"}`}><span></span><strong>{serviceStatus === "checking" ? "Connecting to the local TECS service…" : serviceStatus === "offline" ? "Local TECS service is offline" : apiReady ? "API key configured" : "No API key configured"}</strong></div><label><span>{apiReady ? "Enter a replacement key" : "OpenAI API key"}</span><input type="password" autoComplete="off" disabled={serviceStatus !== "ready"} value={apiKey} onChange={(event) => { setApiKey(event.target.value); setApiSettingsMessage(""); }} /></label>{apiSettingsMessage && <div className={`settings-message ${serviceStatus === "offline" ? "error" : ""}`}>{apiSettingsMessage}</div>}<div className="settings-actions">{apiReady && <button className="remove-key" disabled={busy || serviceStatus !== "ready"} onClick={clearApiKey}><Trash2 size={15} />Remove key</button>}<button className="primary" disabled={!apiKey.trim() || busy || serviceStatus !== "ready"} onClick={configureApiKey}>{busy ? <LoaderCircle className="spin" size={15} /> : <Save size={15} />}{apiReady ? "Save replacement" : "Save API key"}</button></div></section></div>}
+        {apiSettingsOpen && <div className="settings-overlay" onMouseDown={(event) => event.target === event.currentTarget && setApiSettingsOpen(false)}><section className="settings-panel settings-panel-wide" role="dialog" aria-modal="true" aria-labelledby="api-settings-title"><div className="settings-header"><div className="settings-icon">{settingsTab === "api" ? <KeyRound size={20} /> : <Users size={20} />}</div><div><span className="section-kicker">SETTINGS</span><h2 id="api-settings-title">{settingsTab === "api" ? "OpenAI API" : "Shared catalogue"}</h2></div><button className="settings-close" onClick={() => setApiSettingsOpen(false)} aria-label="Close settings">×</button></div><div className="settings-tabs"><button className={settingsTab === "api" ? "active" : ""} onClick={() => setSettingsTab("api")}><KeyRound size={14} />Product API</button><button className={settingsTab === "team" ? "active" : ""} onClick={() => setSettingsTab("team")}><Users size={14} />Shared catalogue</button></div>{settingsTab === "api" ? <><p className="settings-description">The key is stored securely on this computer and is used only for official manufacturer product searches.</p><div className={`api-key-status ${serviceStatus === "offline" ? "offline" : apiReady ? "configured" : "missing"}`}><span></span><strong>{serviceStatus === "checking" ? "Connecting to the local TECS service…" : serviceStatus === "offline" ? "Local TECS service is offline" : apiReady ? "API key configured" : "No API key configured"}</strong></div><label><span>{apiReady ? "Enter a replacement key" : "OpenAI API key"}</span><input type="password" autoComplete="off" disabled={serviceStatus !== "ready"} value={apiKey} onChange={(event) => { setApiKey(event.target.value); setApiSettingsMessage(""); }} /></label>{apiSettingsMessage && <div className={`settings-message ${serviceStatus === "offline" ? "error" : ""}`}>{apiSettingsMessage}</div>}<div className="settings-actions">{apiReady && <button className="remove-key" disabled={busy || serviceStatus !== "ready"} onClick={clearApiKey}><Trash2 size={15} />Remove key</button>}<button className="primary" disabled={!apiKey.trim() || busy || serviceStatus !== "ready"} onClick={configureApiKey}>{busy ? <LoaderCircle className="spin" size={15} /> : <Save size={15} />}{apiReady ? "Save replacement" : "Save API key"}</button></div></> : <><p className="settings-description">The shared product catalogue works automatically. No account, email, password, or setup is required.</p><div className="api-key-status configured"><span></span><strong>{teamCatalog?.syncing ? "Syncing shared products…" : `Ready · ${teamCatalog?.shared_products || 0} shared products`}</strong></div><div className="team-privacy-note"><ShieldCheck size={16} /><span>Only reusable manufacturer product details are shared. Projects, customer files, prices, and OpenAI keys stay local.</span></div>{teamMessage && <div className={`settings-message ${/failed|could not|invalid|error/i.test(teamMessage) ? "error" : ""}`}>{teamMessage}</div>}{teamCatalog?.last_error && <div className="settings-message error">Last automatic sync: {teamCatalog.last_error}</div>}<div className="settings-actions"><button className="primary" disabled={busy || teamCatalog?.syncing} onClick={syncSharedCatalog}>{busy || teamCatalog?.syncing ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}Sync now</button></div></>}</section></div>}
         {error && <div className="error-banner">{error}<button onClick={() => setError("")}>Dismiss</button></div>}
         {success && <div className="success-banner">{success}<button onClick={() => setSuccess("")}>Dismiss</button></div>}
 
@@ -667,6 +1054,7 @@ export default function App() {
                 <button className="secondary" disabled={!files.length || busy} onClick={processDrawings}>{busy ? <LoaderCircle className="spin" size={17} /> : <ArrowRight size={17} />}Extract first draft</button>
               </div>
             </div>
+            {recentProjects.length > 0 && <div className="recent-projects"><div className="recent-projects-heading"><div><span className="section-kicker">RECENT PROJECTS</span><h3>Reopen completed work</h3></div><small>Stored privately on this computer</small></div><div className="recent-project-list">{recentProjects.map((recent) => <article key={recent.id}><div><strong>{recentProjectTitle(recent)}</strong><span>{[recent.client ? `Client: ${recent.client}` : "", recent.reference ? `Reference: ${recent.reference}` : ""].filter(Boolean).join(" · ") || "No client or reference"}</span><small>{recent.draft.items.length} product{recent.draft.items.length === 1 ? "" : "s"} · Completed {new Date(recent.completedAt).toLocaleString()}</small></div><button className="secondary" onClick={() => restoreProject(recent.draft)}>Reopen</button></article>)}</div></div>}
           </section>
         )}
 
@@ -716,34 +1104,58 @@ export default function App() {
 
         {step === 2 && (
           <section className="content workspace-step">
-            <div className="section-heading"><div><span className="section-kicker">AI PRODUCT SELECTION</span><h2>Find and finalize the best product</h2><p>Select a brand. The API searches its official website, ranks verified options, and prepares the comparison for engineer approval.</p></div><span className="count-pill">{BRANDS.length} brands available</span></div>
+            <div className="section-heading"><div><span className="section-kicker">AI PRODUCT SELECTION</span><h2>Find and finalize the best product</h2><p>Stored verified catalogues return immediately. Official sources refresh in the background without discarding the last successful results.</p></div><span className={`count-pill ${catalogApiReady ? "" : "catalog-offline"}`}>{catalogApiReady ? `${catalogInfo?.products || 0} catalogued products · ${BRANDS.length} brands` : "Restart required for catalogue"}</span></div>
+            {warnings.length > 0 && <div className="warning-box">{warnings.map((warning) => <div key={warning}>{warning}</div>)}</div>}
             <div className="split-workspace products-workspace">
               <div className="item-list">
-                {items.map((item) => <button key={item.id} className={`item-tab ${activeItem?.id === item.id ? "active" : ""}`} onClick={() => setActiveId(item.id)}><span className="type-badge">{item.fitting_type}</span><span><strong>{item.product_name || "Product not entered"}</strong><small>{item.brand} · {item.model_no || "model pending"}</small></span></button>)}
+                {items.map((item) => <button key={item.id} className={`item-tab ${activeItem?.id === item.id ? "active" : ""}`} onClick={() => { setActiveId(item.id); if (!catalogBrowseInfo[item.id]) void loadSavedCatalog(item); }}><span className="type-badge">{item.fitting_type}</span><span><strong>{item.product_name || "Product not entered"}</strong><small>{item.brand} · {item.model_no || "model pending"}</small></span></button>)}
               </div>
               {activeItem && <div className="editor-card product-editor">
                 <div className="ai-search-panel">
-                  <div className="search-panel-copy"><div className="ai-icon"><Search size={18} /></div><div><strong>Deep official {activeItem.brand} product research</strong><span>The API explores the approved catalog, product finder, order pages, and technical datasheets, then verifies and ranks exact configurations. A thorough search can take a few minutes.</span></div></div>
-                  {!apiReady ? <button className="outline api-settings-shortcut" onClick={() => setApiSettingsOpen(true)}><Settings size={16} />Configure API in settings</button> : <div className="search-controls"><label className="tolerance-field"><span>Lumens ±</span><input type="number" min="0" max="100" value={searchTolerance.lumens_percent} onChange={(event) => setSearchTolerance((current) => ({ ...current, lumens_percent: Number(event.target.value) }))} /><small>%</small></label><label className="tolerance-field"><span>Watts ±</span><input type="number" min="0" max="100" value={searchTolerance.wattage_percent} onChange={(event) => setSearchTolerance((current) => ({ ...current, wattage_percent: Number(event.target.value) }))} /><small>%</small></label><button className="primary" disabled={searching === activeItem.id} onClick={() => findBestProducts(activeItem)}>{searching === activeItem.id ? <LoaderCircle className="spin" size={16} /> : <Search size={16} />}Search matching options</button></div>}
+                  <div className="search-panel-copy"><div className="ai-icon"><Search size={18} /></div><div><strong>Official {activeItem.brand} product research</strong><span>Use this only when the saved catalogue does not contain the product you need or its information is outdated.</span></div></div>
+                  <div className="search-controls"><label className="tolerance-field"><span>Lumens ±</span><input type="number" min="0" max="100" value={searchTolerance.lumens_percent} onChange={(event) => setSearchTolerance((current) => ({ ...current, lumens_percent: Number(event.target.value) }))} /><small>%</small></label><label className="tolerance-field"><span>Watts ±</span><input type="number" min="0" max="100" value={searchTolerance.wattage_percent} onChange={(event) => setSearchTolerance((current) => ({ ...current, wattage_percent: Number(event.target.value) }))} /><small>%</small></label>{!apiReady ? <button className="outline api-settings-shortcut" onClick={() => setApiSettingsOpen(true)}><Settings size={15} />Configure API</button> : <button className="primary" disabled={!catalogApiReady || searching === activeItem.id || refreshingCatalogs[activeItem.id]} onClick={() => findBestProducts(activeItem)}>{searching === activeItem.id || refreshingCatalogs[activeItem.id] ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}{refreshingCatalogs[activeItem.id] ? "Researching official sources…" : activeCatalog?.products.some((product) => product.freshness === "outdated") ? "Refresh outdated products" : "Search official catalogue"}</button>}</div>
                 </div>
+                {searchInfo[activeItem.id]?.last_verified_at && <div className="catalog-evidence"><ShieldCheck size={13} /><span>Catalogue verified {new Date(searchInfo[activeItem.id].last_verified_at!).toLocaleDateString()}{searchInfo[activeItem.id].stale ? " · refresh in progress" : ""}</span>{searchInfo[activeItem.id].usage && <small>{searchInfo[activeItem.id].usage!.total_tokens.toLocaleString()} API tokens used for that catalogue refresh</small>}</div>}
                 <div className="product-identity">
-                  <label><span>Brand</span><select value={activeItem.brand} onChange={(event) => updateIdentity(activeItem.id, "brand", event.target.value)}>{BRANDS.map((brand) => <option key={brand.name}>{brand.name}</option>)}</select></label>
+                  <label><span>Brand</span><select value={activeItem.brand} disabled={browsingCatalog === activeItem.id} onChange={(event) => { updateIdentity(activeItem.id, "brand", event.target.value); setItemCatalogView(activeItem.id, "saved"); }}>{BRANDS.map((brand) => <option key={brand.name}>{brand.name}</option>)}</select></label>
                   <label><span>Product / family</span><input className="search-output" value={activeItem.product_name} readOnly /></label>
                   <label><span>Model number</span><input className="search-output" value={activeItem.model_no} readOnly /></label>
                   <label><span>Country of origin</span><input className="search-output" value={activeItem.country_of_origin} readOnly /></label>
                   <label><span>Product URL</span><input className="search-output" value={activeItem.product_url} readOnly /></label>
                   <label><span>Datasheet URL</span><input className="search-output" value={activeItem.datasheet_url} readOnly /></label>
                 </div>
-                {(searchResults[activeItem.id]?.length ?? 0) > 0 && <div className="api-results">
-                  <div className="results-heading"><strong>Technical shortlist · {searchResults[activeItem.id].length} distinct option{searchResults[activeItem.id].length === 1 ? "" : "s"}</strong><span>Compare compliance and enter quoted prices before finalizing the commercial choice.</span></div>
-                  <div className="result-grid">{searchResults[activeItem.id].map((product, index) => {
+                <div className="catalog-browser-summary">
+                  <div><strong>Saved {activeItem.brand} catalogue</strong><span>{browsingCatalog === activeItem.id ? "Loading catalogue…" : `${activeCatalog?.products.length || 0} products available`}</span></div>
+                  <div className="catalog-summary-actions">
+                    {catalogView !== "api" && (searchResults[activeItem.id]?.length || 0) > 0 && <button className="catalog-results-open" onClick={() => setItemCatalogView(activeItem.id, "api")}>View {searchResults[activeItem.id].length} search results</button>}
+                    {catalogView !== "saved" && <button className="catalog-open" disabled={browsingCatalog === activeItem.id || !activeCatalog?.products.length} onClick={() => { setItemCatalogView(activeItem.id, "saved"); void loadSavedCatalog(activeItem); }}>Browse saved products</button>}
+                    {catalogView !== "closed" && <button className="catalog-close" onClick={() => setItemCatalogView(activeItem.id, "closed")}><X size={14} />Close</button>}
+                  </div>
+                </div>
+                {catalogView === "saved" && <div className="catalog-browser-toolbar">
+                  <label><span>Brand</span><select value={activeItem.brand} onChange={(event) => updateIdentity(activeItem.id, "brand", event.target.value)}>{BRANDS.map((brand) => <option key={brand.name}>{brand.name}</option>)}</select></label>
+                  <label><span>Product family</span><select value={activeCatalogFilters.family} onChange={(event) => updateCatalogFilter(activeItem.id, "family", event.target.value)}><option>All families</option>{catalogOptions.families.map((family) => <option key={family}>{family}</option>)}</select></label>
+                  <label><span>Mounting</span><select value={activeCatalogFilters.mounting} onChange={(event) => updateCatalogFilter(activeItem.id, "mounting", event.target.value)}><option>All mounting types</option>{catalogOptions.mounting.map((mounting) => <option key={mounting}>{mounting}</option>)}</select></label>
+                  <label><span>CCT</span><select value={activeCatalogFilters.cct} onChange={(event) => updateCatalogFilter(activeItem.id, "cct", event.target.value)}><option>All CCTs</option>{catalogOptions.cct.map((cct) => <option key={cct} value={cct}>{cct} K</option>)}</select></label>
+                  <label><span>Control / driver</span><select value={activeCatalogFilters.control} onChange={(event) => updateCatalogFilter(activeItem.id, "control", event.target.value)}><option>All controls</option>{catalogOptions.controls.map((control) => <option key={control}>{control}</option>)}</select></label>
+                </div>}
+                {!browsingCatalog && activeCatalog && activeCatalog.products.length === 0 && <div className="empty-catalog"><strong>No saved {activeItem.brand} products yet.</strong><span>Run “Search official catalogue” to add verified products.</span></div>}
+                {catalogView === "saved" && !catalogFilterActive && <div className="catalog-filter-prompt"><Search size={16} /><span><strong>Choose a configuration to begin.</strong> Select a family, mounting type, CCT, or control option to display matching products.</span></div>}
+                {catalogView === "saved" && catalogFilterActive && filteredCatalogProducts.length === 0 && <div className="catalog-filter-prompt"><span><strong>No saved products match these filters.</strong> Close the catalogue and use the official API search above.</span></div>}
+                {failedSearches[activeItem.id] && activeItem.product_name && <div className="stale-product-notice"><ShieldCheck size={14} /><span><strong>Previous finalized product retained.</strong> The latest search did not return a verified shortlist, so the product details below were not replaced.</span></div>}
+                {catalogView !== "closed" && filteredCatalogProducts.length > 0 && <div className="api-results">
+                  <div className="results-heading"><strong>{catalogView === "api" ? "Official API search results" : `Saved products matching your filters (${filteredCatalogProducts.length})`}</strong><span>{catalogView === "api" ? "Review the verified results and select the product to use." : "Review the filtered options and select the product to use."}</span></div>
+                  <div className="result-grid">{filteredCatalogProducts.map((product, index) => {
                     const priceKey = `${activeItem.id}:${product.id}`;
-                    const unitPrice = Number(candidatePrices[priceKey]);
+                    const isSelectedProduct = selectedMatches[activeItem.id] === product.id;
+                    const priceValue = candidatePrices[priceKey] ?? (isSelectedProduct && activeItem.unit_price != null ? String(activeItem.unit_price) : "");
+                    const unitCurrency = candidateCurrencies[priceKey] || (isSelectedProduct && activeItem.unit_price_currency) || priceCurrency;
+                    const unitPrice = Number(priceValue);
                     const hasMismatch = product.criteria.some((criterion) => criterion.status === "mismatch");
                     const hasUnknown = product.criteria.some((criterion) => criterion.status === "unknown");
-                    return <article className={`api-product ${selectedMatches[activeItem.id] === product.id ? "selected" : ""}`} key={product.id}>
-                      <div className="result-rank">#{index + 1}</div><div className="result-main"><strong>{product.product_name}</strong><span>{product.product_code || "Order code not published"} · {matchSummary(product)}</span><div className="verification-row"><span className={`verification-badge ${product.verification_level || "product_page"}`}><ShieldCheck size={11} />{verificationLabel(product)}</span>{(product.evidence_urls?.length || 0) > 0 && <small>{product.evidence_urls!.length} official source{product.evidence_urls!.length === 1 ? "" : "s"} checked</small>}</div><div className="product-facts">{productFacts(product).map((fact) => <small key={fact}>{fact}</small>)}</div><div className="result-links"><button onClick={() => openOfficialLink(product.product_url)}>Official product <ExternalLink size={11} /></button>{product.datasheet_url && <button onClick={() => openOfficialLink(product.datasheet_url!)}>Datasheet <ExternalLink size={11} /></button>}</div></div><div className={`result-score ${product.score >= 80 ? "high" : ""}`}>{product.score}%<small>match</small></div><button className={selectedMatches[activeItem.id] === product.id ? "selected-product" : "select-product"} onClick={() => finalizeProduct(activeItem, product)}>{selectedMatches[activeItem.id] === product.id ? <><Check size={14} />Finalized</> : "Use product"}</button>
-                      <div className="commercial-row"><span className={`tolerance-badge ${hasMismatch ? "outside" : hasUnknown ? "verify" : "inside"}`}>{hasMismatch ? "Outside one or more limits" : hasUnknown ? "Within known limits · verify gaps" : "Within selected tolerance"}</span><label><span>Quoted unit price</span><select className="currency-select" value={priceCurrency} onChange={(event) => setPriceCurrency(event.target.value as "OMR" | "AED" | "USD")}><option value="OMR">OMR</option><option value="AED">AED</option><option value="USD">USD</option></select><input type="number" min="0" step="0.001" value={candidatePrices[priceKey] || ""} onChange={(event) => setCandidatePrices((current) => ({ ...current, [priceKey]: event.target.value }))} placeholder="Optional" /></label>{unitPrice > 0 && activeItem.quantity > 0 && <strong>Total: {priceCurrency} {(unitPrice * activeItem.quantity).toLocaleString(undefined, { maximumFractionDigits: 3 })}</strong>}</div>
+                    return <article className={`api-product ${catalogView === "saved" ? "manual-catalog-product" : ""} ${selectedMatches[activeItem.id] === product.id ? "selected" : ""}`} key={product.id}>
+                      <div className="result-rank">{catalogView === "api" ? `#${index + 1}` : <Search size={12} />}</div><div className="result-main"><strong>{product.product_name}</strong><span>{product.product_code || "Order code not published"} · {product.catalog_family || "Other products"}{catalogView === "api" ? ` · ${matchSummary(product)}` : ""}</span><div className="verification-row"><span className={`freshness-badge ${product.freshness || "current"}`}>{product.freshness === "outdated" ? "Outdated" : product.freshness === "incomplete" ? "Missing details" : "Current"}</span><span className={`verification-badge ${product.verification_level || "product_page"}`}><ShieldCheck size={11} />{verificationLabel(product)}</span>{product.verified_at && <small>Verified {new Date(product.verified_at).toLocaleDateString()}</small>}<small className={`manufacturer-date ${product.manufacturer_updated_at ? "published" : "unknown"}`}>Manufacturer updated: {displayManufacturerDate(product.manufacturer_updated_at)}</small></div><div className="product-facts">{productFacts(product).map((fact) => <small key={fact}>{fact}</small>)}</div><div className="result-links"><button onClick={() => openOfficialLink(product.product_url)}>Official product <ExternalLink size={11} /></button>{product.datasheet_url && <button onClick={() => openOfficialLink(product.datasheet_url!)}>Datasheet <ExternalLink size={11} /></button>}</div></div>{catalogView === "api" && <div className={`result-score ${product.score >= 80 ? "high" : ""}`}>{product.score}%<small>match</small></div>}<button className={selectedMatches[activeItem.id] === product.id ? "selected-product" : "select-product"} onClick={() => finalizeProduct(activeItem, product)}>{selectedMatches[activeItem.id] === product.id ? <><Check size={14} />Finalized</> : "Use product"}</button>
+                      <div className="commercial-row"><span className={`tolerance-badge ${hasMismatch ? "outside" : hasUnknown ? "verify" : "inside"}`}>{hasMismatch ? "Outside one or more limits" : hasUnknown ? "Within known limits · verify gaps" : "Within selected tolerance"}</span><label><span>Supplier unit price</span><select className="currency-select" value={unitCurrency} onChange={(event) => { const currency = event.target.value as Currency; setCandidateCurrencies((current) => ({ ...current, [priceKey]: currency })); if (isSelectedProduct) updateItem(activeItem.id, (current) => ({ ...current, unit_price_currency: currency })); }}>{CURRENCIES.map((currency) => <option key={currency}>{currency}</option>)}</select><input type="number" min="0" step="0.001" value={priceValue} onChange={(event) => { const value = event.target.value; setCandidatePrices((current) => ({ ...current, [priceKey]: value })); if (isSelectedProduct) updateItem(activeItem.id, (current) => ({ ...current, unit_price: value === "" ? null : Number(value), unit_price_currency: value === "" ? null : unitCurrency })); }} placeholder="Optional" /></label>{unitPrice > 0 && activeItem.quantity > 0 && <strong>Supplier total: {unitCurrency} {(unitPrice * activeItem.quantity).toLocaleString(undefined, { maximumFractionDigits: 3 })}</strong>}</div>
                       <details className="criteria-details"><summary>View requirement comparison ({product.criteria.length})</summary><div className="criteria-grid"><strong>Category</strong><strong>Required</strong><strong>Offered</strong><strong>Result</strong>{product.criteria.map((criterion) => <div className="criterion-row" key={criterion.criterion}><span>{criterion.criterion}</span><span>{criterion.required}</span><span>{criterion.offered}</span><span className={`criterion-status ${criterion.status}`}>{criterion.status}</span></div>)}</div></details>
                     </article>;
                   })}</div>
@@ -756,26 +1168,29 @@ export default function App() {
                 </div>
               </div>}
             </div>
-            <div className="page-actions"><button className="secondary" onClick={() => setStep(1)}><ArrowLeft size={17} />Requirements</button><button className="primary" disabled={items.some((item) => !item.product_name.trim())} onClick={() => setStep(3)}>Prepare technical sheets <ArrowRight size={17} /></button></div>
+            <div className="page-actions"><button className="secondary" onClick={() => setStep(1)}><ArrowLeft size={17} />Requirements</button><button className="primary" disabled={items.some((item) => !item.product_name.trim())} onClick={() => setStep(3)}>Prepare quotations <ArrowRight size={17} /></button></div>
           </section>
         )}
 
         {step === 3 && (
           <section className="content sheets-step">
-            <div className="section-heading"><div><span className="section-kicker">SUBMISSION PACKAGE</span><h2>Individual technical data sheets</h2><p>Select the products to include. Each fitting exports as its own formatted sheet or PDF page.</p></div><div className="summary-pills"><span className="good">{totals.complies} compliant</span><span className="bad">{totals.deviations} deviations</span><span>{totals.pending} pending</span></div></div>
+            <div className="section-heading"><div><span className="section-kicker">SUBMISSION PACKAGE</span><h2>Technical and commercial quotations</h2><p>Select the products to include. Export the individual technical sheets or the commercial costing and offer workbook.</p></div><div className="summary-pills"><span className="good">{totals.complies} compliant</span><span className="bad">{totals.deviations} deviations</span><span>{totals.pending} pending</span></div></div>
             <div className="sheet-list">
               {items.map((item) => {
                 const deviations = item.rows.filter((row) => row.status === "deviation").length;
                 const pending = item.rows.filter((row) => row.status === "pending").length;
                 return <article className={`sheet-card ${item.selected ? "selected" : ""}`} key={item.id}>
                   <label className="select-sheet"><input type="checkbox" checked={item.selected} onChange={(event) => updateItem(item.id, (current) => ({ ...current, selected: event.target.checked }))} /><span className="type-badge">{item.fitting_type}</span></label>
-                  <div className="sheet-product"><strong>{item.product_name || "Product name pending"}</strong><span>{item.brand} · {item.model_no || "Model pending"}</span></div>
+                  <div className="sheet-product"><strong>{item.product_name || "Product name pending"}</strong><span>{item.brand} · {item.model_no || "Model pending"}</span>{item.unit_price != null && <label className="sheet-price-currency"><span>Supplier price</span><select value={item.unit_price_currency || priceCurrency} onChange={(event) => updateItem(item.id, (current) => ({ ...current, unit_price_currency: event.target.value as Currency }))}>{CURRENCIES.map((currency) => <option key={currency}>{currency}</option>)}</select><strong>{item.unit_price.toLocaleString(undefined, { maximumFractionDigits: 3 })}</strong></label>}</div>
                   <div className="sheet-status">{deviations ? <span className="deviation-dot">{deviations} deviation{deviations === 1 ? "" : "s"}</span> : <span className="complies-dot"><CheckCircle2 size={14} />No deviations</span>}{pending > 0 && <small>{pending} pending</small>}</div>
                   <div className="sheet-actions"><button onClick={() => exportSheets("xlsx", item)}><FileSpreadsheet size={15} />Excel</button><button onClick={() => exportSheets("pdf", item)}><FileText size={15} />PDF</button></div>
                 </article>;
               })}
             </div>
-            <div className="export-panel"><div><Download size={22} /><span><strong>Export selected package</strong><small>{selectedItems.length} product{selectedItems.length === 1 ? "" : "s"} selected</small></span></div><button className="secondary" disabled={!selectedItems.length || busy} onClick={() => exportSheets("xlsx")}>{busy ? <LoaderCircle className="spin" size={17} /> : <FileSpreadsheet size={17} />}Excel workbook</button><button className="primary" disabled={!selectedItems.length || busy} onClick={() => exportSheets("pdf")}>{busy ? <LoaderCircle className="spin" size={17} /> : <FileText size={17} />}Combined PDF</button></div>
+            <div className="exchange-rate-panel"><div className="exchange-rate-copy"><strong>Offer currency and exchange rates</strong><span>Enter how much one unit of each supplier currency equals in the selected offer currency.</span></div><label className="offer-currency"><span>Offer currency</span><select className="currency-select" value={priceCurrency} onChange={(event) => setPriceCurrency(event.target.value as Currency)}>{CURRENCIES.map((currency) => <option key={currency}>{currency}</option>)}</select></label><div className="exchange-rate-grid">{CURRENCIES.map((currency) => <label key={currency} className={currency === priceCurrency ? "base-rate" : ""}><span>1 {currency} =</span><input type="number" min="0" step="0.000001" disabled={currency === priceCurrency} value={currency === priceCurrency ? 1 : exchangeRateSets[priceCurrency][currency] ?? ""} onChange={(event) => { const value = event.target.value; setExchangeRateSets((current) => ({ ...current, [priceCurrency]: { ...current[priceCurrency], [currency]: value === "" ? undefined : Number(value) } })); }} placeholder="Rate" /><small>{priceCurrency}</small></label>)}</div></div>
+            <div className="export-destination"><div><FolderOpen size={17} /><span><strong>Export folder</strong><small title={exportFolder}>{exportFolder || "Downloads"}</small></span></div><button className="secondary" disabled={busy || serviceStatus !== "ready"} onClick={selectExportFolder}>Choose folder</button></div>
+            <div className="export-panel"><div><Download size={22} /><span><strong>Export selected package</strong><small>{selectedItems.length} product{selectedItems.length === 1 ? "" : "s"} selected · filenames use project, client, and reference</small></span></div><button className="secondary" disabled={!selectedItems.length || busy} onClick={exportCommercialQuotation}>{busy ? <LoaderCircle className="spin" size={17} /> : <FileSpreadsheet size={17} />}Commercial Excel</button><button className="secondary" disabled={!selectedItems.length || busy} onClick={() => exportSheets("xlsx")}>{busy ? <LoaderCircle className="spin" size={17} /> : <FileSpreadsheet size={17} />}Technical Excel</button><button className="primary" disabled={!selectedItems.length || busy} onClick={() => exportSheets("pdf")}>{busy ? <LoaderCircle className="spin" size={17} /> : <FileText size={17} />}Technical PDF</button></div>
+            {lastExportAt && <div className="finish-project-panel"><div><CheckCircle2 size={20} /><span><strong>Exports completed?</strong><small>Archive this project and clear the workspace when you are ready to begin another.</small></span></div><button className="primary" disabled={busy} onClick={finishProjectAndStartNew}>Finish project and start new <ArrowRight size={16} /></button></div>}
             <div className="page-actions"><button className="secondary" onClick={() => setStep(2)}><ArrowLeft size={17} />Offered products</button></div>
           </section>
         )}

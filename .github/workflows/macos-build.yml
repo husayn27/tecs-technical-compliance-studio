@@ -37,6 +37,7 @@ jobs:
             --name tecs-engine \
             --paths services/local_engine/src \
             --collect-data tecs_engine \
+            --add-data "services/local_engine/src/tecs_engine/assets:tecs_engine/assets" \
             --collect-all rapidocr \
             --collect-all onnxruntime \
             services/local_engine/sidecar_entry.py

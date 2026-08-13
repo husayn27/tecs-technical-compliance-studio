@@ -132,15 +132,29 @@ class ProductMatch(BaseModel):
     description: str
     evidence_urls: list[HttpUrl] = Field(default_factory=list)
     verification_level: Literal["datasheet", "multi_source", "product_page"] = "product_page"
+    manufacturer_updated_at: str | None = None
     specifications: ProductSpecifications = Field(default_factory=ProductSpecifications)
     score: float = Field(ge=0, le=100)
     criteria: list[CriterionResult]
+
+
+class ApiUsage(BaseModel):
+    input_tokens: int = 0
+    output_tokens: int = 0
+    reasoning_tokens: int = 0
+    total_tokens: int = 0
+    web_search_calls: int = 0
 
 
 class ProductSearchResponse(BaseModel):
     matches: list[ProductMatch]
     searched_domain: str
     warnings: list[str] = Field(default_factory=list)
+    source: Literal["live", "catalog"] = "live"
+    refreshing: bool = False
+    stale: bool = False
+    last_verified_at: str | None = None
+    usage: ApiUsage | None = None
 
 
 class SelectedLine(BaseModel):
@@ -186,9 +200,20 @@ class TechnicalItem(BaseModel):
     model_no: str = ""
     product_url: str | None = None
     datasheet_url: str | None = None
+    unit_price: float | None = Field(default=None, ge=0)
+    unit_price_currency: Literal["OMR", "AED", "USD", "GBP", "EUR"] | None = None
     rows: list[ComplianceRow] = Field(default_factory=list)
 
 
 class TechnicalSheetRequest(BaseModel):
     project: ProjectDetails
     items: list[TechnicalItem]
+
+
+class CommercialQuotationRequest(BaseModel):
+    project: ProjectDetails
+    items: list[TechnicalItem]
+    currency: Literal["OMR", "AED", "USD", "GBP", "EUR"] = "OMR"
+    exchange_rates: dict[Literal["OMR", "AED", "USD", "GBP", "EUR"], float] = Field(
+        default_factory=dict
+    )

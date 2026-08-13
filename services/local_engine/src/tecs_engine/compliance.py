@@ -7,6 +7,7 @@ from copy import copy, deepcopy
 import re
 
 from openpyxl import Workbook, load_workbook
+from openpyxl.cell.cell import MergedCell
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
@@ -166,19 +167,22 @@ def build_compliance_xlsx(request: TechnicalSheetRequest) -> bytes:
         if sheet is not base:
             workbook.remove(sheet)
 
+    # Create every item sheet from the untouched template before populating any
+    # product. Otherwise later copies inherit values written for the first item.
+    item_sheets = [base]
+    for _ in items[1:]:
+        copied = workbook.copy_worksheet(base)
+        copied.page_margins = copy(base.page_margins)
+        copied.page_setup = copy(base.page_setup)
+        copied.print_options = copy(base.print_options)
+        copied.sheet_properties = copy(base.sheet_properties)
+        copied.sheet_format = copy(base.sheet_format)
+        copied.freeze_panes = base.freeze_panes
+        copied.print_area = base.print_area
+        item_sheets.append(copied)
+
     used: set[str] = set()
-    for item_index, item in enumerate(items):
-        if item_index == 0:
-            sheet = base
-        else:
-            sheet = workbook.copy_worksheet(base)
-            sheet.page_margins = copy(base.page_margins)
-            sheet.page_setup = copy(base.page_setup)
-            sheet.print_options = copy(base.print_options)
-            sheet.sheet_properties = copy(base.sheet_properties)
-            sheet.sheet_format = copy(base.sheet_format)
-            sheet.freeze_panes = base.freeze_panes
-            sheet.print_area = base.print_area
+    for sheet, item in zip(item_sheets, items, strict=True):
         sheet._images = []
         for image_data, anchor in template_images:
             duplicated = XLImage(BytesIO(image_data))
@@ -217,6 +221,14 @@ def _populate_template_sheet(sheet, request: TechnicalSheetRequest, item: Techni
         "Finish": 27,
         "Remarks": 28,
     }
+    # The source template contains example VLOOKUP formulas and cached values.
+    # Exports are driven only by the current project, so optional fields that
+    # were not supplied must remain blank instead of leaking template examples.
+    for row_number in row_map.values():
+        for column in ("C", "D", "E"):
+            cell = sheet[f"{column}{row_number}"]
+            if not isinstance(cell, MergedCell):
+                cell.value = None
     by_parameter = {row.parameter: row for row in item.rows}
     for parameter, row_number in row_map.items():
         row = by_parameter.get(parameter)

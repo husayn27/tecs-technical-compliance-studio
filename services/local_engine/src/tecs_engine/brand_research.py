@@ -15,6 +15,31 @@ class BrandResearchProfile:
     research_notes: str = ""
 
 
+# Manufacturer catalogues and older projects sometimes use the product brand
+# (Philips) while the approved research profile uses its parent company
+# (Signify). Keep one canonical key for lookups without losing compatibility
+# with records already saved under either label.
+BRAND_ALIASES: dict[str, str] = {
+    "signify": "Signify",
+    "philips": "Signify",
+    "philips lighting": "Signify",
+    "signify / philips": "Signify",
+    "signify/philips": "Signify",
+}
+
+
+def canonical_brand(value: str) -> str:
+    cleaned = " ".join((value or "").strip().split())
+    return BRAND_ALIASES.get(cleaned.casefold(), cleaned)
+
+
+def brand_variants(value: str) -> tuple[str, ...]:
+    canonical = canonical_brand(value)
+    if canonical == "Signify":
+        return ("Signify", "Philips", "Philips Lighting", "Signify / Philips", "Signify/Philips")
+    return (canonical,)
+
+
 # These are intentionally manufacturer-specific. A document host is trusted only
 # for the brand that publishes through it; generic file-hosting domains are never
 # accepted globally.

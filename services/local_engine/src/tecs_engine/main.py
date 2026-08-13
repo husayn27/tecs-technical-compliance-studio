@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
 import re
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Annotated
@@ -12,31 +15,108 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 
+from .catalog import CatalogService
+from . import __version__
+from .commercial import build_commercial_xlsx
+from .compliance import build_compliance_pdf, build_compliance_xlsx
 from .extractor import extract_pdf_detailed
 from .local_ai import extract_pdf_with_local_ai
 from .local_ai import runtime as local_ai_runtime
 from .models import (
     ApiKeyRequest,
+    CommercialQuotationRequest,
     ExtractionResponse,
     FixtureApprovalRequest,
     ProductSearchRequest,
     QuoteRequest,
     TechnicalSheetRequest,
 )
-from .compliance import build_compliance_pdf, build_compliance_xlsx
-from .product_search import delete_api_key, has_api_key, save_api_key, search_products
+from .product_search import delete_api_key, has_api_key, save_api_key
 from .quote import build_pdf, build_xlsx
+from .shared_catalog import SharedCatalogService
 from .storage import KnowledgeStore
 
-app = FastAPI(title="TECS Lighting Engine", version="0.1.0")
+app = FastAPI(title="TECS Lighting Engine", version=__version__)
 knowledge = KnowledgeStore()
+shared_catalog = SharedCatalogService(knowledge)
+catalog = CatalogService(knowledge, on_catalog_updated=shared_catalog.product_saved)
+
+
+def _settings_path() -> Path:
+    return knowledge.root / "settings.json"
+
+
+def _read_local_settings() -> dict:
+    try:
+        return json.loads(_settings_path().read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        return {}
+
+
+def _write_local_settings(settings: dict) -> None:
+    target = _settings_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(".tmp")
+    temporary.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+    temporary.replace(target)
+
+
+def _export_directory() -> Path:
+    environment = os.getenv("TECS_EXPORT_DIR")
+    if environment:
+        return Path(environment).expanduser()
+    configured = _read_local_settings().get("export_directory")
+    return Path(configured).expanduser() if configured else Path.home() / "Downloads"
+
+
+def _choose_export_directory() -> Path | None:
+    current = _export_directory()
+    if sys.platform == "win32":
+        escaped_current = str(current).replace("'", "''")
+        script = (
+            "Add-Type -AssemblyName System.Windows.Forms; "
+            "$dialog = New-Object System.Windows.Forms.FolderBrowserDialog; "
+            f"$dialog.SelectedPath = '{escaped_current}'; "
+            "$dialog.Description = 'Choose where TECS exports will be saved'; "
+            "if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) "
+            "{ [Console]::Out.Write($dialog.SelectedPath) }"
+        )
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-STA", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+        )
+    elif sys.platform == "darwin":
+        result = subprocess.run(
+            [
+                "osascript",
+                "-e",
+                'POSIX path of (choose folder with prompt "Choose where TECS exports will be saved")',
+            ],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+        )
+    else:
+        raise RuntimeError("Folder selection is supported in the Windows and macOS apps.")
+    selected = result.stdout.strip()
+    return Path(selected) if result.returncode == 0 and selected else None
+
+
+@app.on_event("startup")
+def start_catalog_scheduler() -> None:
+    catalog.start_scheduler()
+    shared_catalog.start_scheduler()
 
 
 def _save_export(content: bytes, filename: str, extension: str) -> dict[str, str | bool]:
     safe_stem = Path(filename).stem
     safe_stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "-", safe_stem).strip(" .-")
     safe_stem = safe_stem[:120] or "TECS-Technical-Compliance"
-    export_dir = Path(os.getenv("TECS_EXPORT_DIR", Path.home() / "Downloads"))
+    export_dir = _export_directory()
     export_dir.mkdir(parents=True, exist_ok=True)
     target = export_dir / f"{safe_stem}.{extension}"
     copy_number = 2
@@ -59,10 +139,32 @@ app.add_middleware(
 )
 
 
+@app.get("/api/settings/export-folder")
+def export_folder() -> dict[str, str]:
+    return {"path": str(_export_directory())}
+
+
+@app.post("/api/settings/export-folder/choose")
+def choose_export_folder() -> dict[str, str | bool]:
+    try:
+        selected = _choose_export_directory()
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+        raise HTTPException(status_code=500, detail=str(error)) from error
+    if selected is None:
+        return {"selected": False, "path": str(_export_directory())}
+    selected.mkdir(parents=True, exist_ok=True)
+    settings = _read_local_settings()
+    settings["export_directory"] = str(selected)
+    _write_local_settings(settings)
+    return {"selected": True, "path": str(selected)}
+
+
 @app.get("/api/health")
 def health() -> dict:
     return {
         "status": "ok",
+        "engine_version": app.version,
+        "catalog_api": True,
         "api_key_configured": has_api_key(),
         "local_ai": local_ai_runtime.status().model_dump(),
     }
@@ -76,6 +178,48 @@ def local_ai_status() -> dict:
 @app.get("/api/learning/stats")
 def learning_stats() -> dict:
     return knowledge.learning_stats()
+
+
+@app.get("/api/catalog/status")
+def catalog_status() -> dict:
+    return {**catalog.status(), "team_catalog": shared_catalog.status()}
+
+
+@app.get("/api/settings/team-catalog")
+def team_catalog_status() -> dict:
+    return shared_catalog.status()
+
+
+@app.post("/api/catalog/team-sync")
+def sync_team_catalog() -> dict:
+    try:
+        return shared_catalog.sync()
+    except RuntimeError as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+
+
+@app.post("/api/catalog/search-status")
+def catalog_search_status(request: ProductSearchRequest) -> dict:
+    try:
+        return catalog.scope_status(request)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+
+@app.post("/api/catalog/browse")
+def browse_catalog(request: ProductSearchRequest) -> dict:
+    try:
+        return catalog.browse(request)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+
+@app.post("/api/catalog/brands/{brand}/refresh")
+def refresh_catalog_brand(brand: str) -> dict:
+    try:
+        return {"started": catalog.refresh_brand(brand)}
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
 
 
 @app.post("/api/settings/api-key")
@@ -213,9 +357,9 @@ def document_preview(project_id: str, document_id: str, page: int) -> Response:
 
 
 @app.post("/api/products/search")
-def products(request: ProductSearchRequest):
+def products(request: ProductSearchRequest, refresh: bool = False):
     try:
-        return search_products(request)
+        return catalog.search(request, refresh=refresh)
     except Exception as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
 
@@ -282,6 +426,17 @@ def save_compliance_pdf(
 ) -> dict[str, str | bool]:
     try:
         return _save_export(build_compliance_pdf(request), filename, "pdf")
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+
+@app.post("/api/commercial/xlsx/save")
+def save_commercial_xlsx(
+    request: CommercialQuotationRequest,
+    filename: str = "TECS-Commercial-Quotation",
+) -> dict[str, str | bool]:
+    try:
+        return _save_export(build_commercial_xlsx(request), filename, "xlsx")
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
 

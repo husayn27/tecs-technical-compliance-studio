@@ -12,8 +12,9 @@ from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
 
+from .brand_research import brand_variants, canonical_brand
 from .knowledge import SEED_PROFILES
-from .models import FixtureRequirement
+from .models import ApiUsage, FixtureRequirement, ProductMatch
 
 LEARNABLE_FIELDS = (
     "description",
@@ -152,6 +153,35 @@ class KnowledgeStore:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY (family_id, project_id)
                 );
+                CREATE TABLE IF NOT EXISTS catalog_scopes (
+                    scope_key TEXT PRIMARY KEY,
+                    brand TEXT NOT NULL,
+                    fixture_json TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'idle',
+                    last_attempt_at TEXT,
+                    last_verified_at TEXT,
+                    last_error TEXT,
+                    usage_json TEXT,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS catalog_products (
+                    scope_key TEXT NOT NULL REFERENCES catalog_scopes(scope_key) ON DELETE CASCADE,
+                    identity TEXT NOT NULL,
+                    product_json TEXT NOT NULL,
+                    verified_at TEXT NOT NULL,
+                    PRIMARY KEY (scope_key, identity)
+                );
+                CREATE INDEX IF NOT EXISTS catalog_products_scope_idx
+                    ON catalog_products(scope_key);
+                CREATE TABLE IF NOT EXISTS shared_catalog_products (
+                    identity TEXT PRIMARY KEY,
+                    brand TEXT NOT NULL,
+                    product_json TEXT NOT NULL,
+                    verified_at TEXT NOT NULL,
+                    synced_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS shared_catalog_products_brand_idx
+                    ON shared_catalog_products(brand);
                 """
             )
             columns = {
@@ -166,7 +196,283 @@ class KnowledgeStore:
                     "INSERT OR IGNORE INTO profiles VALUES (?, ?, ?, ?)",
                     (profile.id, profile.name, json.dumps(profile.signatures), _now()),
                 )
+            # A process can be stopped during a background refresh. Such a job
+            # cannot still be running after restart, so make it safely retryable.
+            connection.execute(
+                """
+                UPDATE catalog_scopes
+                SET status='interrupted',
+                    last_error='The application closed before this catalogue refresh completed.',
+                    updated_at=?
+                WHERE status='refreshing'
+                """,
+                (_now(),),
+            )
 
+    def catalog_refresh_started(
+        self, scope: str, brand: str, fixture: FixtureRequirement
+    ) -> None:
+        now = _now()
+        brand = canonical_brand(brand)
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO catalog_scopes
+                    (scope_key, brand, fixture_json, status, last_attempt_at, updated_at)
+                VALUES (?, ?, ?, 'refreshing', ?, ?)
+                ON CONFLICT(scope_key) DO UPDATE SET
+                    brand=excluded.brand,
+                    fixture_json=excluded.fixture_json,
+                    status='refreshing',
+                    last_attempt_at=excluded.last_attempt_at,
+                    updated_at=excluded.updated_at
+                """,
+                (scope, brand, fixture.model_dump_json(), now, now),
+            )
+
+    def replace_catalog_scope(
+        self,
+        scope: str,
+        brand: str,
+        fixture: FixtureRequirement,
+        products: list[ProductMatch],
+        verified_at: str,
+        usage: ApiUsage | None,
+    ) -> None:
+        brand = canonical_brand(brand)
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO catalog_scopes
+                    (scope_key, brand, fixture_json, status, last_attempt_at,
+                     last_verified_at, last_error, usage_json, updated_at)
+                VALUES (?, ?, ?, 'idle', ?, ?, NULL, ?, ?)
+                ON CONFLICT(scope_key) DO UPDATE SET
+                    brand=excluded.brand,
+                    fixture_json=excluded.fixture_json,
+                    status='idle',
+                    last_attempt_at=excluded.last_attempt_at,
+                    last_verified_at=excluded.last_verified_at,
+                    last_error=NULL,
+                    usage_json=excluded.usage_json,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    scope,
+                    brand,
+                    fixture.model_dump_json(),
+                    verified_at,
+                    verified_at,
+                    usage.model_dump_json() if usage else None,
+                    verified_at,
+                ),
+            )
+            connection.execute("DELETE FROM catalog_products WHERE scope_key = ?", (scope,))
+            for product in products:
+                identity = str(product.product_code or product.product_url).strip().lower()
+                connection.execute(
+                    "INSERT INTO catalog_products VALUES (?, ?, ?, ?)",
+                    (scope, identity, product.model_dump_json(), verified_at),
+                )
+
+    def catalog_refresh_failed(self, scope: str, error: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE catalog_scopes
+                SET status='failed', last_error=?, updated_at=?
+                WHERE scope_key=?
+                """,
+                (error[:1000], _now(), scope),
+            )
+
+    def catalog_snapshot(self, scope: str) -> dict:
+        with self._connect() as connection:
+            scope_row = connection.execute(
+                "SELECT * FROM catalog_scopes WHERE scope_key=?", (scope,)
+            ).fetchone()
+            products = connection.execute(
+                "SELECT product_json FROM catalog_products WHERE scope_key=?", (scope,)
+            ).fetchall()
+        if not scope_row:
+            return {"products": []}
+        return {
+            "products": [json.loads(row["product_json"]) for row in products],
+            "status": scope_row["status"],
+            "last_attempt_at": scope_row["last_attempt_at"],
+            "last_verified_at": scope_row["last_verified_at"],
+            "last_error": scope_row["last_error"],
+            "usage": json.loads(scope_row["usage_json"]) if scope_row["usage_json"] else None,
+        }
+
+    def catalog_products_for_brand(self, brand: str) -> list[dict]:
+        """Return a de-duplicated union of all verified category scopes for a brand."""
+        variants = tuple(value.casefold() for value in brand_variants(brand))
+        placeholders = ", ".join("?" for _ in variants)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT p.identity, p.product_json, p.verified_at
+                FROM catalog_products p
+                JOIN catalog_scopes s ON s.scope_key = p.scope_key
+                WHERE lower(s.brand) IN ({placeholders})
+                ORDER BY p.verified_at DESC
+                """,
+                variants,
+            ).fetchall()
+            shared_rows = connection.execute(
+                f"""
+                SELECT identity, product_json, verified_at
+                FROM shared_catalog_products
+                WHERE lower(brand) IN ({placeholders})
+                ORDER BY verified_at DESC
+                """,
+                variants,
+            ).fetchall()
+        products: list[dict] = []
+        seen: set[str] = set()
+        for row in [*rows, *shared_rows]:
+            if row["identity"] in seen:
+                continue
+            seen.add(row["identity"])
+            products.append(json.loads(row["product_json"]))
+        return products
+
+    def catalog_records_for_brand(self, brand: str) -> list[dict]:
+        """Return de-duplicated saved products with their verification dates."""
+        variants = tuple(value.casefold() for value in brand_variants(brand))
+        placeholders = ", ".join("?" for _ in variants)
+        with self._connect() as connection:
+            local_rows = connection.execute(
+                f"""
+                SELECT p.identity, p.product_json, p.verified_at
+                FROM catalog_products p
+                JOIN catalog_scopes s ON s.scope_key = p.scope_key
+                WHERE lower(s.brand) IN ({placeholders})
+                ORDER BY p.verified_at DESC
+                """,
+                variants,
+            ).fetchall()
+            shared_rows = connection.execute(
+                f"""
+                SELECT identity, product_json, verified_at
+                FROM shared_catalog_products
+                WHERE lower(brand) IN ({placeholders})
+                ORDER BY verified_at DESC
+                """,
+                variants,
+            ).fetchall()
+        records: list[dict] = []
+        seen: set[str] = set()
+        for row in [*local_rows, *shared_rows]:
+            if row["identity"] in seen:
+                continue
+            seen.add(row["identity"])
+            records.append(
+                {"product": json.loads(row["product_json"]), "verified_at": row["verified_at"]}
+            )
+        return records
+
+    def shared_catalog_replace(self, records: list[dict]) -> int:
+        """Atomically replace the local mirror with authenticated cloud records."""
+        now = _now()
+        valid: list[tuple[str, str, str, str, str]] = []
+        for record in records:
+            try:
+                product = ProductMatch.model_validate(record["product_json"])
+                identity = str(record.get("identity") or product.product_code or product.product_url)
+                brand = canonical_brand(str(record.get("brand") or product.brand))
+                verified_at = str(record.get("verified_at") or now)
+                valid.append(
+                    (identity.strip().lower(), brand, product.model_dump_json(), verified_at, now)
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+        with self._connect() as connection:
+            connection.execute("DELETE FROM shared_catalog_products")
+            connection.executemany(
+                "INSERT INTO shared_catalog_products VALUES (?, ?, ?, ?, ?)", valid
+            )
+        return len(valid)
+
+    def catalog_products_for_sharing(self) -> list[dict]:
+        """Return only reusable verified product data; no project or fixture data."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT p.identity, s.brand, p.product_json, p.verified_at
+                FROM catalog_products p
+                JOIN catalog_scopes s ON s.scope_key = p.scope_key
+                ORDER BY p.verified_at DESC
+                """
+            ).fetchall()
+        records: list[dict] = []
+        seen: set[str] = set()
+        for row in rows:
+            identity = row["identity"]
+            if identity in seen:
+                continue
+            seen.add(identity)
+            product = json.loads(row["product_json"])
+            records.append(
+                {
+                    "identity": identity,
+                    "brand": row["brand"],
+                    "product_name": product.get("product_name", ""),
+                    "product_code": product.get("product_code"),
+                    "product_url": product.get("product_url", ""),
+                    "product_json": product,
+                    "verified_at": row["verified_at"],
+                    "updated_at": _now(),
+                }
+            )
+        return records
+
+    def catalog_scopes_for_brand(self, brand: str) -> list[sqlite3.Row]:
+        variants = tuple(value.casefold() for value in brand_variants(brand))
+        placeholders = ", ".join("?" for _ in variants)
+        with self._connect() as connection:
+            return connection.execute(
+                f"SELECT scope_key, fixture_json FROM catalog_scopes "
+                f"WHERE lower(brand) IN ({placeholders})",
+                variants,
+            ).fetchall()
+
+    def catalog_scopes(self) -> list[sqlite3.Row]:
+        with self._connect() as connection:
+            return connection.execute(
+                "SELECT scope_key, brand, fixture_json, last_verified_at FROM catalog_scopes"
+            ).fetchall()
+
+    def catalog_stats(self) -> dict:
+        with self._connect() as connection:
+            counts = connection.execute(
+                """
+                SELECT COUNT(*) scopes,
+                       COUNT(DISTINCT brand) brands,
+                       MAX(last_verified_at) last_verified_at
+                FROM catalog_scopes
+                """
+            ).fetchone()
+            products = connection.execute(
+                """
+                SELECT COUNT(DISTINCT identity) FROM (
+                    SELECT identity FROM catalog_products
+                    UNION ALL
+                    SELECT identity FROM shared_catalog_products
+                )
+                """
+            ).fetchone()[0]
+            shared_products = connection.execute(
+                "SELECT COUNT(*) FROM shared_catalog_products"
+            ).fetchone()[0]
+        return {
+            "scopes": counts["scopes"],
+            "brands": counts["brands"],
+            "products": products,
+            "shared_products": shared_products,
+            "last_verified_at": counts["last_verified_at"],
+        }
     def resolve_learned_family(self, text: str, filename: str) -> tuple[str, float]:
         features = _layout_features(text)
         with self._connect() as connection:

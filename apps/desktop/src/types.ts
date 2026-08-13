@@ -66,6 +66,7 @@ export type Product = {
   description: string;
   evidence_urls?: string[];
   verification_level?: "datasheet" | "multi_source" | "product_page";
+  manufacturer_updated_at?: string | null;
   specifications: {
     product_type?: string | null;
     country_of_origin?: string | null;
@@ -101,6 +102,60 @@ export type Product = {
   };
   score: number;
   criteria: Criterion[];
+  catalog_family?: string;
+  verified_at?: string;
+  freshness?: "current" | "outdated" | "incomplete";
+};
+
+export type CatalogBrowseResponse = {
+  products: Product[];
+  families: string[];
+  facets?: {
+    families: string[];
+    mounting: string[];
+    cct: number[];
+    controls: string[];
+  };
+  requirement_family: string;
+  freshness_days: number;
+};
+
+export type ApiUsage = {
+  input_tokens: number;
+  output_tokens: number;
+  reasoning_tokens: number;
+  total_tokens: number;
+  web_search_calls: number;
+};
+
+export type ProductSearchResponse = {
+  matches: Product[];
+  warnings: string[];
+  searched_domain: string;
+  source: "live" | "catalog";
+  refreshing: boolean;
+  stale: boolean;
+  last_verified_at?: string | null;
+  usage?: ApiUsage | null;
+};
+
+export type CatalogStatus = {
+  scopes: number;
+  brands: number;
+  products: number;
+  active_refreshes: number;
+  freshness_days: number;
+  last_verified_at?: string | null;
+  shared_products?: number;
+  team_catalog?: TeamCatalogStatus;
+};
+
+export type TeamCatalogStatus = {
+  configured: boolean;
+  syncing: boolean;
+  last_sync_at?: string | null;
+  last_error?: string | null;
+  shared_products: number;
 };
 
 export type QuoteLine = { fixture: Fixture; product: Product };
@@ -114,6 +169,8 @@ export type ProjectDetails = {
 };
 
 export type ComplianceStatus = "complies" | "deviation" | "pending" | "not_applicable";
+
+export type Currency = "OMR" | "AED" | "USD" | "GBP" | "EUR";
 
 export type ComplianceRow = {
   parameter: string;
@@ -148,6 +205,8 @@ export type ComplianceItem = {
   model_no: string;
   product_url: string;
   datasheet_url: string;
+  unit_price: number | null;
+  unit_price_currency?: Currency | null;
   legend: LegendRequirements;
   rows: ComplianceRow[];
 };

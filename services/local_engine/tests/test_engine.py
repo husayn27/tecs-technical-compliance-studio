@@ -7,15 +7,19 @@ from fastapi.testclient import TestClient
 from openpyxl import load_workbook
 from pypdf import PdfReader
 from reportlab.pdfgen import canvas
+import pytest
 
 from tecs_engine.extractor import WATT_RE, extract_pdf
 from tecs_engine.main import app
 from tecs_engine.compliance import build_compliance_pdf, build_compliance_xlsx
+from tecs_engine.commercial import build_commercial_xlsx
 from tecs_engine.models import (
+    CommercialQuotationRequest,
     ComplianceRow,
     CriterionResult,
     FixtureRequirement,
     ProductMatch,
+    ProductSearchRequest,
     QuoteRequest,
     SelectedLine,
     ProjectDetails,
@@ -293,12 +297,30 @@ def test_builds_individual_compliance_sheets() -> None:
 
     multi_request = request.model_copy(deep=True)
     multi_request.items.append(
-        request.items[0].model_copy(update={"id": "f2", "fitting_type": "F2, F2E"}, deep=True)
+        request.items[0].model_copy(
+            update={
+                "id": "f2",
+                "fitting_type": "F2, F2E",
+                "rows": [
+                    ComplianceRow(
+                        parameter="Description",
+                        proposed="Proposed LED luminaire",
+                        status="complies",
+                    )
+                ],
+            },
+            deep=True,
+        )
     )
     multi_workbook = load_workbook(BytesIO(build_compliance_xlsx(multi_request)))
     assert multi_workbook.sheetnames == ["F1, F1E", "F2, F2E"]
     assert len(multi_workbook["F2, F2E"]._images) == 1
     assert multi_workbook["F2, F2E"]["D10"].value == "F2, F2E"
+    assert multi_workbook["F2, F2E"]["D13"].value == "Proposed LED luminaire"
+    assert multi_workbook["F2, F2E"]["C21"].value is None
+    assert multi_workbook["F2, F2E"]["D21"].value is None
+    assert multi_workbook["F2, F2E"]["C25"].value is None
+    assert multi_workbook["F2, F2E"]["D25"].value is None
 
     pdf = build_compliance_pdf(request)
     reader = PdfReader(BytesIO(pdf))
@@ -306,6 +328,137 @@ def test_builds_individual_compliance_sheets() -> None:
     text = reader.pages[0].extract_text() or ""
     assert "TECHNICAL DATA SHEET" in text
     assert "Offered input power is 2 W higher" in text
+
+
+def test_builds_commercial_workbook_from_exact_template() -> None:
+    request = CommercialQuotationRequest(
+        project=ProjectDetails(
+            project_name="New Car Showroom",
+            client="Example Client",
+            consultant="Example Consultant",
+            contractor="Example Contractor",
+            reference="CQ-001",
+        ),
+        currency="GBP",
+        exchange_rates={"EUR": 0.85},
+        items=[
+            TechnicalItem(
+                id="f1",
+                fitting_type="F1",
+                quantity=8,
+                brand="LuxeLED",
+                product_name="Mellow III Backlit Panel",
+                country_of_origin="United Kingdom",
+                model_no="MEL-III-4K-40W",
+                unit_price=27.5,
+                unit_price_currency="EUR",
+                rows=[
+                    ComplianceRow(
+                        parameter="Description",
+                        proposed="595 x 595 mm recessed LED panel",
+                        status="complies",
+                    )
+                ],
+            ),
+            TechnicalItem(
+                id="f2",
+                fitting_type="F2",
+                quantity=4,
+                brand="Signify",
+                product_name="Recessed downlight",
+                model_no="DN100",
+                unit_price=None,
+            ),
+        ],
+    )
+
+    workbook = load_workbook(BytesIO(build_commercial_xlsx(request)), data_only=False)
+    assert workbook.sheetnames == ["Costing", "Offer"]
+    for sheet in workbook.worksheets:
+        assert sheet["C6"].value == "Example Contractor"
+        assert sheet["C7"].value == "Consultant : Example Consultant"
+        assert sheet["C9"].value == "PROJECT : New Car Showroom"
+        assert sheet["C12"].value == "REFERENCE: CQ-001"
+        assert sheet["C16"].value == "595 x 595 mm recessed LED panel"
+        assert sheet["D16"].value == "LuxeLED - United Kingdom"
+        assert sheet["H16"].value == "Euro"
+        assert sheet["I16"].value == 27.5
+        assert sheet["J16"].value == 1
+        assert sheet["K16"].value == 0.85
+        assert sheet["L16"].value == 1.15
+        assert sheet["M16"].value == '=IF(I16="","",F16*I16*J16*K16*(L16-1))'
+        assert sheet["N16"].value == 1.07
+        assert sheet["O16"].value == 0
+        assert sheet["P16"].value == '=IF(I16="","",(I16*J16*K16*L16*N16)+O16)'
+        assert sheet["Q16"].value == '=IF(P16="","",F16*P16)'
+        assert sheet["R16"].value == '=IF(P16="","",ROUNDUP(P16/0.7,0))'
+        assert sheet["S16"].value == '=IF(R16="","",R16*F16)'
+        assert sheet["I17"].value is None
+        assert sheet["H17"].value is None
+        assert sheet["K17"].value is None
+        assert sheet["S17"].value == '=IF(R17="","",R17*F17)'
+        assert sheet["R14"].value == "U.Price (GBP)"
+        assert sheet["S14"].value == "T.Price\n(GBP)"
+        assert sheet["S135"].value == '=IF(COUNT(I16:I17)=0,"",SUM(S16:S17))'
+        assert sheet.row_dimensions[18].hidden is True
+    assert workbook["Offer"]["B135"].value == "OFFER VALUE IN GBP"
+    assert workbook["Costing"]["B135"].value is None
+    assert workbook["Offer"].column_dimensions["H"].hidden is True
+
+
+def test_commercial_export_saves_to_configured_download_folder(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("TECS_EXPORT_DIR", str(tmp_path))
+    request = CommercialQuotationRequest(
+        project=ProjectDetails(project_name="Commercial Export Test"),
+        currency="EUR",
+        items=[
+            TechnicalItem(
+                id="f1",
+                fitting_type="F1",
+                quantity=2,
+                brand="Whitecroft Lighting",
+                product_name="Tegan 2",
+                model_no="TG2-01",
+            )
+        ],
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/commercial/xlsx/save?filename=TECS-Commercial-Quotation",
+        json=request.model_dump(mode="json"),
+    )
+
+    assert response.status_code == 200
+    saved_path = Path(response.json()["path"])
+    assert saved_path == tmp_path / "TECS-Commercial-Quotation.xlsx"
+    workbook = load_workbook(saved_path, data_only=False)
+    assert workbook["Offer"]["R14"].value == "U.Price (EUR)"
+    assert workbook["Offer"]["I16"].value is None
+
+
+def test_commercial_export_requires_rate_for_priced_foreign_currency() -> None:
+    request = CommercialQuotationRequest(
+        project=ProjectDetails(project_name="Exchange Rate Test"),
+        currency="OMR",
+        exchange_rates={},
+        items=[
+            TechnicalItem(
+                id="f1",
+                fitting_type="F1",
+                quantity=1,
+                brand="Whitecroft Lighting",
+                product_name="Tegan 2",
+                unit_price=50,
+                unit_price_currency="EUR",
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="EUR to OMR exchange rate"):
+        build_commercial_xlsx(request)
 
 
 def test_compliance_export_saves_to_configured_download_folder(
@@ -345,6 +498,16 @@ def test_compliance_export_saves_to_configured_download_folder(
     assert saved_path.read_bytes().startswith(b"PK")
 
 
+def test_export_folder_setting_can_be_read(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("TECS_EXPORT_DIR", str(tmp_path))
+    client = TestClient(app)
+
+    response = client.get("/api/settings/export-folder")
+
+    assert response.status_code == 200
+    assert response.json()["path"] == str(tmp_path)
+
+
 def test_health_and_quote_endpoints(monkeypatch) -> None:
     monkeypatch.setattr("tecs_engine.main.has_api_key", lambda: False)
     client = TestClient(app)
@@ -360,6 +523,18 @@ def test_health_and_quote_endpoints(monkeypatch) -> None:
     assert response.status_code == 200
     assert response.headers["content-type"] == "application/pdf"
     assert response.content.startswith(b"%PDF")
+
+
+def test_catalog_browse_endpoint_does_not_require_api_research(monkeypatch) -> None:
+    client = TestClient(app)
+    request = ProductSearchRequest(fixture=make_fixture(), brand="LuxeLED")
+
+    response = client.post("/api/catalog/browse", json=request.model_dump(mode="json"))
+
+    assert response.status_code == 200
+    assert set(response.json()) == {
+        "products", "families", "facets", "requirement_family", "freshness_days"
+    }
 
 
 def test_api_key_can_be_saved_and_removed(monkeypatch) -> None:

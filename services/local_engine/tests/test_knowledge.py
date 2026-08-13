@@ -16,6 +16,7 @@ from tecs_engine.product_search import (
     _anonymous_requirement,
     _discovery_schema,
     _official_url,
+    _manufacturer_date,
     _product_schema,
     _research_client,
     _score_product,
@@ -37,6 +38,12 @@ def fixture(quantity: int = 4) -> FixtureRequirement:
         ip_rating=66,
         source_file="renamed.pdf",
     )
+
+
+def test_manufacturer_date_accepts_only_real_iso_dates() -> None:
+    assert _manufacturer_date("2026-07-20") == "2026-07-20"
+    assert _manufacturer_date("updated July 2026") is None
+    assert _manufacturer_date("2026-02-31") is None
 
 
 def test_matches_seed_profiles_from_content_not_filename() -> None:
@@ -277,10 +284,12 @@ def test_verification_level_prefers_datasheet_then_multiple_sources() -> None:
 
 def test_deep_search_schemas_require_evidence_for_every_candidate() -> None:
     discovery = _discovery_schema()["properties"]["candidates"]["items"]
-    products = _product_schema()["properties"]["matches"]["items"]
+    product_schema = _product_schema()["properties"]["matches"]
+    products = product_schema["items"]
     assert "evidence_urls" in discovery["required"]
     assert "publication_status" in discovery["required"]
     assert "evidence_urls" in products["required"]
+    assert product_schema["maxItems"] == 5
 
 
 def test_research_client_has_a_bounded_timeout(monkeypatch) -> None:
@@ -347,6 +356,7 @@ def test_product_search_runs_discovery_then_exact_verification(monkeypatch) -> N
                 "product_url": "https://www.signify.com/global/prof/product-one",
                 "datasheet_url": "https://www.signify.com/api/assets/product-one.pdf",
                 "image_url": None,
+                "manufacturer_updated_at": "2026-07-20",
                 "evidence_urls": [
                     "https://www.signify.com/global/prof/product-one",
                     "https://www.signify.com/api/assets/product-one.pdf",
@@ -378,10 +388,12 @@ def test_product_search_runs_discovery_then_exact_verification(monkeypatch) -> N
     response = search_products(request)
 
     assert len(calls) == 2
-    assert calls[0]["tools"][0]["search_context_size"] == "high"
+    assert calls[0]["tools"][0]["search_context_size"] == "medium"
     assert calls[1]["tools"][0]["search_context_size"] == "high"
     verification_content = calls[1]["input"][0]["content"]
     assert any(item.get("type") == "input_file" for item in verification_content)
+    assert calls[1]["tool_choice"] == "auto"
     assert response.matches[0].product_code == "CODE-1"
     assert response.matches[0].verification_level == "datasheet"
+    assert response.matches[0].manufacturer_updated_at == "2026-07-20"
     assert len(response.matches[0].evidence_urls) == 2

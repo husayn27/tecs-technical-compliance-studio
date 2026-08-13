@@ -4,13 +4,15 @@ import json
 import os
 import re
 import uuid
+from datetime import date
 from urllib.parse import urlparse
 
 import keyring
 from openai import APITimeoutError, OpenAI
 
-from .brand_research import BRAND_RESEARCH_PROFILES
+from .brand_research import BRAND_RESEARCH_PROFILES, canonical_brand
 from .models import (
+    ApiUsage,
     CriterionResult,
     ProductMatch,
     ProductSearchRequest,
@@ -106,24 +108,74 @@ def _required_height(dimensions: str | None) -> float | None:
     return float(match.group(1)) if match else None
 
 
+def _normalized_words(value: str | None) -> set[str]:
+    if not value:
+        return set()
+    aliases = {
+        "dowlinght": "downlight",
+        "down light": "downlight",
+        "recessed mounted": "recessed",
+        "surface mounted": "surface",
+        "fixed output": "fixed",
+        "on/off": "fixed",
+    }
+    normalized = value.lower()
+    for source, target in aliases.items():
+        normalized = normalized.replace(source, target)
+    return set(re.findall(r"[a-z0-9]+", normalized))
+
+
+def _category_status(required: str, offered: str | None) -> str:
+    if not offered:
+        return "unknown"
+    required_words = _normalized_words(required)
+    offered_words = _normalized_words(offered)
+    categories = (
+        {"downlight", "spotlight"},
+        {"panel", "troffer"},
+        {"floodlight", "projector"},
+        {"bollard"},
+        {"streetlight", "road", "lantern"},
+        {"linear", "batten", "trunking"},
+        {"highbay", "lowbay"},
+        {"wall", "sconce"},
+        {"track"},
+        {"strip", "tape"},
+    )
+    required_category = next((group for group in categories if required_words & group), None)
+    offered_category = next((group for group in categories if offered_words & group), None)
+    if required_category and offered_category:
+        return "match" if required_category is offered_category else "mismatch"
+    return "match" if required_words & offered_words else "unknown"
+
+
+def _text_status(required: str, offered: str | None) -> str:
+    if not offered:
+        return "unknown"
+    required_words = _normalized_words(required)
+    offered_words = _normalized_words(offered)
+    return "match" if required_words <= offered_words or required_words & offered_words else "mismatch"
+
+
+def _controls_status(required: list[str], offered: list[str]) -> str:
+    if not offered:
+        return "unknown"
+    offered_words = _normalized_words(" ".join(offered))
+    return "match" if all(_normalized_words(value) & offered_words for value in required) else "mismatch"
+
+
 def _score_product(
     request: ProductSearchRequest, specs: ProductSpecifications
 ) -> tuple[float, list[CriterionResult]]:
     fixture = request.fixture
     criteria: list[tuple[CriterionResult, int]] = []
 
-    type_status = (
-        "unknown" if specs.type_compatible is None
-        else "match" if specs.type_compatible else "mismatch"
-    )
+    type_status = _category_status(fixture.fixture_type, specs.product_type)
     criteria.append(
         (_criterion("Fixture type", fixture.fixture_type, specs.product_type, type_status), 22)
     )
     if fixture.mounting:
-        mounting_status = (
-            "unknown" if specs.mounting_compatible is None
-            else "match" if specs.mounting_compatible else "mismatch"
-        )
+        mounting_status = _text_status(fixture.mounting, specs.mounting)
         criteria.append(
             (_criterion("Mounting", fixture.mounting, specs.mounting, mounting_status), 14)
         )
@@ -196,18 +248,12 @@ def _score_product(
         )
         criteria.append((_criterion("Height", required_height, specs.height_mm, status, " mm"), 14))
     elif fixture.dimensions:
-        status = (
-            "unknown" if specs.dimensions_compatible is None
-            else "match" if specs.dimensions_compatible else "mismatch"
-        )
+        status = _text_status(fixture.dimensions, specs.dimensions)
         criteria.append(
             (_criterion("Dimensions", fixture.dimensions, specs.dimensions, status), 10)
         )
     if fixture.construction:
-        status = (
-            "unknown" if specs.construction_compatible is None
-            else "match" if specs.construction_compatible else "mismatch"
-        )
+        status = _text_status(fixture.construction, specs.construction)
         criteria.append(
             (_criterion("Construction", fixture.construction, specs.construction, status), 6)
         )
@@ -221,18 +267,12 @@ def _score_product(
         status = "unknown" if specs.waterproof is None else "match" if fixture.waterproof == specs.waterproof else "mismatch"
         criteria.append((_criterion("Waterproof", fixture.waterproof, specs.waterproof, status), 5))
     if fixture.optical_details:
-        status = (
-            "unknown" if specs.optical_details_compatible is None
-            else "match" if specs.optical_details_compatible else "mismatch"
-        )
+        status = _text_status(fixture.optical_details, specs.optical_details)
         criteria.append(
             (_criterion("Diffuser / reflector", fixture.optical_details, specs.optical_details, status), 8)
         )
     if fixture.controls:
-        status = (
-            "unknown" if specs.controls_compatible is None
-            else "match" if specs.controls_compatible else "mismatch"
-        )
+        status = _controls_status(fixture.controls, specs.controls)
         criteria.append(
             (
                 _criterion(
@@ -314,7 +354,7 @@ def _api_key() -> str:
     return key
 
 
-def _product_schema(max_items: int = 15) -> dict:
+def _product_schema(max_items: int = 5) -> dict:
     return {
         "type": "object",
         "properties": {
@@ -330,6 +370,7 @@ def _product_schema(max_items: int = 15) -> dict:
                         "product_url": {"type": "string"},
                         "datasheet_url": {"type": ["string", "null"]},
                         "image_url": {"type": ["string", "null"]},
+                        "manufacturer_updated_at": {"type": ["string", "null"]},
                         "evidence_urls": {
                             "type": "array",
                             "maxItems": 6,
@@ -386,7 +427,7 @@ def _product_schema(max_items: int = 15) -> dict:
                     },
                     "required": [
                         "brand", "product_name", "product_code", "product_url", "datasheet_url",
-                        "image_url", "evidence_urls", "description", "specifications",
+                        "image_url", "manufacturer_updated_at", "evidence_urls", "description", "specifications",
                     ],
                     "additionalProperties": False,
                 },
@@ -451,12 +492,51 @@ def _verification_level(product_url: str, datasheet_url: str | None, evidence: l
     return "multi_source" if len(evidence) >= 2 else "product_page"
 
 
+def _manufacturer_date(value: str | None) -> str | None:
+    """Accept only explicit ISO calendar dates returned from official evidence."""
+    if not value or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value.strip()):
+        return None
+    try:
+        return date.fromisoformat(value.strip()).isoformat()
+    except ValueError:
+        return None
+
+
 def _research_client() -> OpenAI:
-    timeout = float(os.getenv("TECS_PRODUCT_SEARCH_TIMEOUT_SECONDS", "150"))
+    # Deep verification can include several manufacturer PDFs plus live catalog
+    # searches. 150 seconds was too short for otherwise successful responses on
+    # slower catalog sites (notably Wix-hosted technical documents).
+    timeout = float(os.getenv("TECS_PRODUCT_SEARCH_TIMEOUT_SECONDS", "240"))
     return OpenAI(api_key=_api_key(), timeout=timeout, max_retries=0)
 
 
+def _response_usage(response) -> ApiUsage:
+    usage = getattr(response, "usage", None)
+    output_details = getattr(usage, "output_tokens_details", None) if usage else None
+    output_items = getattr(response, "output", []) or []
+    return ApiUsage(
+        input_tokens=getattr(usage, "input_tokens", 0) or 0,
+        output_tokens=getattr(usage, "output_tokens", 0) or 0,
+        reasoning_tokens=getattr(output_details, "reasoning_tokens", 0) or 0,
+        total_tokens=getattr(usage, "total_tokens", 0) or 0,
+        web_search_calls=sum(
+            1 for item in output_items if getattr(item, "type", None) == "web_search_call"
+        ),
+    )
+
+
+def _combine_usage(*values: ApiUsage) -> ApiUsage:
+    return ApiUsage(
+        input_tokens=sum(value.input_tokens for value in values),
+        output_tokens=sum(value.output_tokens for value in values),
+        reasoning_tokens=sum(value.reasoning_tokens for value in values),
+        total_tokens=sum(value.total_tokens for value in values),
+        web_search_calls=sum(value.web_search_calls for value in values),
+    )
+
+
 def search_products(request: ProductSearchRequest) -> ProductSearchResponse:
+    request = request.model_copy(update={"brand": canonical_brand(request.brand)})
     profile = BRAND_RESEARCH_PROFILES.get(request.brand)
     if not profile:
         raise ValueError("The selected manufacturer is not approved.")
@@ -494,28 +574,43 @@ Rules:
 - Return evidence URLs actually inspected for each candidate.
 """.strip()
 
-    discovery_response = client.with_options(timeout=min(client.timeout, 90.0)).responses.create(
-        model=os.getenv("OPENAI_MODEL", "gpt-5.6"),
-        reasoning={"effort": "medium"},
-        tools=[{
-            "type": "web_search",
-            "filters": {"allowed_domains": search_domains},
-            "search_context_size": "high",
-        }],
-        tool_choice="required",
-        include=["web_search_call.action.sources"],
-        input=discovery_prompt,
-        text={
-            "format": {
-                "type": "json_schema",
-                "name": "lighting_catalog_discovery",
-                "strict": True,
-                "schema": _discovery_schema(),
-            }
-        },
-        store=False,
-    )
-    discovery_payload = json.loads(discovery_response.output_text)
+    discovery_usage = ApiUsage()
+    discovery_warning: str | None = None
+    try:
+        discovery_response = client.with_options(
+            timeout=min(client.timeout, 120.0)
+        ).responses.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-5.6"),
+            reasoning={"effort": "low"},
+            tools=[{
+                "type": "web_search",
+                "filters": {"allowed_domains": search_domains},
+                "search_context_size": "medium",
+            }],
+            tool_choice="required",
+            include=["web_search_call.action.sources"],
+            input=discovery_prompt,
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "lighting_catalog_discovery",
+                    "strict": True,
+                    "schema": _discovery_schema(),
+                }
+            },
+            store=False,
+        )
+        discovery_payload = json.loads(discovery_response.output_text)
+        discovery_usage = _response_usage(discovery_response)
+    except APITimeoutError:
+        # Discovery is useful but not a prerequisite. Continue from the brand's
+        # curated official catalogue pages/PDFs so one slow web-search pass can
+        # never throw away the entire catalogue refresh.
+        discovery_payload = {"candidates": []}
+        discovery_warning = (
+            "The broad discovery pass was slow; verification continued from the "
+            "approved official catalogue pages and documents."
+        )
     discovered: list[dict] = []
     discovered_pdfs = list(profile.verified_product_pdfs)
     for candidate in discovery_payload.get("candidates", []):
@@ -540,13 +635,24 @@ Rules:
         for url in evidence:
             if urlparse(url).path.lower().endswith(".pdf") and url not in discovered_pdfs:
                 discovered_pdfs.append(url)
+    if not discovered:
+        discovered = [
+            {
+                "product_name": f"{profile.official_name} official catalogue lead",
+                "product_code": None,
+                "product_url": url,
+                "datasheet_url": None,
+                "evidence_urls": [url],
+            }
+            for url in profile.catalog_pages
+        ]
 
     verification_prompt = f"""
 Complete a second-pass, evidence-based technical verification for {profile.official_name}.
 Deeply inspect the official product pages, configuration/order tables, linked technical
 downloads, and PDFs for the discovered candidates. Also continue searching the official
 catalog in case the discovery pass missed a better category-compatible option. Return up
-to 15 distinct, current, orderable configurations and extract variant-level specifications.
+to 5 distinct, current, orderable configurations and extract variant-level specifications.
 
 Requirement JSON:
 {json.dumps(fixture, indent=2)}
@@ -572,6 +678,10 @@ Verification rules:
   specification fields must be null. Never assemble a fictional order code.
 - Prefer product_url as the exact product/configuration page. Put the technical PDF in
   datasheet_url and list every official page actually used in evidence_urls.
+- manufacturer_updated_at is the most recent explicit manufacturer-issued product-page
+  update date, datasheet revision date, or technical-document issue date, in ISO YYYY-MM-DD
+  format. Use null when no official source explicitly publishes a reliable date. Do not use
+  today's research date, a search-engine date, a download timestamp, or infer a date.
 - Do not return discontinued/phased-out products unless the current manufacturer page
   explicitly shows they remain orderable; normally omit them.
 - Return null rather than infer values from unrelated variants, marketing text, images,
@@ -589,14 +699,18 @@ Verification rules:
 - Do not invent specifications. Use unknown when the official page does not state a value.
 - Keep different order codes when they represent genuinely different configurations.
 - Do not return the same order code or product page more than once.
-- Return no more than fifteen distinct products.
+- Return no more than five distinct products.
 """.strip()
 
     input_content: list[dict] = [{"type": "input_text", "text": verification_prompt}]
     for pdf_url in discovered_pdfs[:4]:
         input_content.append({"type": "input_file", "file_url": pdf_url, "detail": "low"})
+    has_official_pdf_input = any(
+        item.get("type") == "input_file" for item in input_content
+    )
 
     verification_timed_out = False
+    verification_usage = ApiUsage()
     try:
         response = client.responses.create(
             model=os.getenv("OPENAI_MODEL", "gpt-5.6"),
@@ -606,7 +720,11 @@ Verification rules:
                 "filters": {"allowed_domains": search_domains},
                 "search_context_size": "high",
             }],
-            tool_choice="required",
+            # Discovery has already searched the official sites. When official
+            # PDFs are attached, let verification answer from those documents
+            # without forcing another slow web-search round trip. Web search
+            # remains available when the PDF does not contain enough evidence.
+            tool_choice="auto" if has_official_pdf_input else "required",
             include=["web_search_call.action.sources"],
             input=[{"role": "user", "content": input_content}],
             text={
@@ -619,6 +737,7 @@ Verification rules:
             },
             store=False,
         )
+        verification_usage = _response_usage(response)
         payload = json.loads(response.output_text)
     except APITimeoutError:
         verification_timed_out = True
@@ -626,6 +745,8 @@ Verification rules:
     matches: list[ProductMatch] = []
     seen_products: set[str] = set()
     warnings: list[str] = []
+    if discovery_warning:
+        warnings.append(discovery_warning)
     if verification_timed_out:
         warnings.append(
             "The detailed verification pass timed out. No unverified discovery-only "
@@ -668,6 +789,7 @@ Verification rules:
                 verification_level=_verification_level(
                     product_url, datasheet_url, evidence_urls
                 ),
+                manufacturer_updated_at=_manufacturer_date(item.get("manufacturer_updated_at")),
                 specifications=specifications,
                 score=score,
                 criteria=criteria,
@@ -675,5 +797,8 @@ Verification rules:
         )
     matches.sort(key=lambda product: product.score, reverse=True)
     return ProductSearchResponse(
-        matches=matches[:15], searched_domain=approved_domain, warnings=warnings
+        matches=matches[:5],
+        searched_domain=approved_domain,
+        warnings=warnings,
+        usage=_combine_usage(discovery_usage, verification_usage),
     )
