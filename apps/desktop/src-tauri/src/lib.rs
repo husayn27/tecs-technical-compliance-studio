@@ -55,7 +55,8 @@ pub fn run() {
     app.run(|handle, event| {
         if let RunEvent::Exit = event {
             let state = handle.state::<EngineState>();
-            if let Some(child) = state.child.lock().unwrap().take() {
+            let child = state.child.lock().unwrap().take();
+            if let Some(child) = child {
                 let _ = child.kill();
             }
         }
