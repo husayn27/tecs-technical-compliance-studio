@@ -18,6 +18,26 @@ trap cleanup_tecs EXIT INT TERM
 
 echo "Starting TECS Technical Compliance Studio..."
 
+# A double-clickable .command can still be launched when macOS has denied
+# Terminal access to the Documents folder. Check real file access before
+# starting either background process so the launcher cannot report success
+# after Python and Node have already failed with EPERM.
+if [[ -x "$TECS_ENGINE_PYTHON" ]] && ! /bin/cat "$TECS_PROJECT_ROOT/services/local_engine/.venv/pyvenv.cfg" >/dev/null 2>&1; then
+  echo ""
+  echo "macOS is blocking Terminal from reading the TECS project folder."
+  echo "Open System Settings > Privacy & Security > Files & Folders,"
+  echo "enable Documents Folder access for Terminal, then run this file again."
+  echo "If Terminal is not listed there, enable Terminal under Full Disk Access."
+  exit 1
+fi
+
+if ! (cd "$TECS_DESKTOP_DIR" && /bin/ls package.json node_modules/vite/bin/vite.js >/dev/null 2>&1); then
+  echo ""
+  echo "Terminal cannot read the TECS desktop files."
+  echo "Allow Terminal to access Documents in System Settings > Privacy & Security, then retry."
+  exit 1
+fi
+
 TECS_ENGINE_RUNNING=false
 TECS_UI_RUNNING=false
 lsof -n -P -iTCP:8765 -sTCP:LISTEN >/dev/null 2>&1 && TECS_ENGINE_RUNNING=true
@@ -47,18 +67,33 @@ fi
 
 if [[ "$TECS_UI_RUNNING" == true ]]; then
   echo "The TECS interface is already running."
-elif command -v pnpm >/dev/null 2>&1; then
-  (cd "$TECS_DESKTOP_DIR" && pnpm dev --host 127.0.0.1) &
-  TECS_UI_PID=$!
 elif [[ -x "$TECS_BUNDLED_NODE" ]]; then
   (cd "$TECS_DESKTOP_DIR" && "$TECS_BUNDLED_NODE" node_modules/vite/bin/vite.js --host 127.0.0.1 --port 1420) &
+  TECS_UI_PID=$!
+elif command -v pnpm >/dev/null 2>&1; then
+  (cd "$TECS_DESKTOP_DIR" && pnpm dev --host 127.0.0.1) &
   TECS_UI_PID=$!
 else
   echo "The development runtime was not found. Open this project in Codex and ask it to restore dependencies."
   exit 1
 fi
 
-sleep 3
+TECS_READY=false
+for _ in {1..30}; do
+  if /usr/bin/curl --fail --silent "http://127.0.0.1:8765/api/health" >/dev/null 2>&1 \
+    && /usr/bin/curl --fail --silent "http://127.0.0.1:1420" >/dev/null 2>&1; then
+    TECS_READY=true
+    break
+  fi
+  sleep 1
+done
+
+if [[ "$TECS_READY" != true ]]; then
+  echo ""
+  echo "TECS did not start successfully. Review the errors above, then run this file again."
+  exit 1
+fi
+
 open "http://127.0.0.1:1420"
 
 echo ""

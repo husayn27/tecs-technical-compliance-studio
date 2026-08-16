@@ -10,6 +10,7 @@ from reportlab.pdfgen import canvas
 import pytest
 
 from tecs_engine.extractor import WATT_RE, extract_pdf
+from tecs_engine import main as engine_main
 from tecs_engine.main import app
 from tecs_engine.compliance import build_compliance_pdf, build_compliance_xlsx
 from tecs_engine.commercial import build_commercial_xlsx
@@ -523,6 +524,16 @@ def test_health_and_quote_endpoints(monkeypatch) -> None:
     assert response.status_code == 200
     assert response.headers["content-type"] == "application/pdf"
     assert response.content.startswith(b"%PDF")
+
+
+def test_packaged_engine_uses_the_desktop_selected_port(monkeypatch) -> None:
+    calls: list[dict] = []
+    monkeypatch.setenv("TECS_ENGINE_PORT", "18765")
+    monkeypatch.setattr(engine_main.uvicorn, "run", lambda *args, **kwargs: calls.append(kwargs))
+
+    engine_main.run()
+
+    assert calls == [{"host": "127.0.0.1", "port": 18765, "log_level": "info"}]
 
 
 def test_catalog_browse_endpoint_does_not_require_api_research(monkeypatch) -> None:

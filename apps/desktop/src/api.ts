@@ -1,8 +1,15 @@
 import type { CatalogBrowseResponse, CatalogStatus, ComplianceItem, Currency, Fixture, LocalAIStatus, ProductSearchResponse, ProjectDetails, QuoteLine, TeamCatalogStatus } from "./types";
-import { isTauri } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-shell";
 
-const BASE_URL = "http://127.0.0.1:8765/api";
+let baseUrl = "http://127.0.0.1:8765/api";
+
+export async function initializeApiEndpoint() {
+  if (isTauri()) {
+    const endpoint = await invoke<string>("engine_endpoint");
+    baseUrl = `${endpoint.replace(/\/$/, "")}/api`;
+  }
+}
 
 async function parsed<T>(response: Response): Promise<T> {
   if (!response.ok) {
@@ -13,12 +20,12 @@ async function parsed<T>(response: Response): Promise<T> {
 }
 
 export async function health() {
-  return parsed<{ status: string; engine_version?: string; catalog_api?: boolean; api_key_configured: boolean; local_ai: LocalAIStatus }>(await fetch(`${BASE_URL}/health`));
+  return parsed<{ status: string; engine_version?: string; catalog_api?: boolean; api_key_configured: boolean; local_ai: LocalAIStatus }>(await fetch(`${baseUrl}/health`));
 }
 
 export async function saveApiKey(apiKey: string) {
   return parsed<{ saved: boolean }>(
-    await fetch(`${BASE_URL}/settings/api-key`, {
+    await fetch(`${baseUrl}/settings/api-key`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ api_key: apiKey }),
@@ -28,27 +35,27 @@ export async function saveApiKey(apiKey: string) {
 
 export async function removeApiKey() {
   return parsed<{ removed: boolean; api_key_configured: boolean }>(
-    await fetch(`${BASE_URL}/settings/api-key`, { method: "DELETE" }),
+    await fetch(`${baseUrl}/settings/api-key`, { method: "DELETE" }),
   );
 }
 
 export async function getExportFolder() {
-  return parsed<{ path: string }>(await fetch(`${BASE_URL}/settings/export-folder`));
+  return parsed<{ path: string }>(await fetch(`${baseUrl}/settings/export-folder`));
 }
 
 export async function chooseExportFolder() {
   return parsed<{ selected: boolean; path: string }>(
-    await fetch(`${BASE_URL}/settings/export-folder/choose`, { method: "POST" }),
+    await fetch(`${baseUrl}/settings/export-folder/choose`, { method: "POST" }),
   );
 }
 
 export async function teamCatalogStatus() {
-  return parsed<TeamCatalogStatus>(await fetch(`${BASE_URL}/settings/team-catalog`));
+  return parsed<TeamCatalogStatus>(await fetch(`${baseUrl}/settings/team-catalog`));
 }
 
 export async function syncTeamCatalog() {
   return parsed<{ started: boolean; uploaded: number; downloaded: number }>(
-    await fetch(`${BASE_URL}/catalog/team-sync`, { method: "POST" }),
+    await fetch(`${baseUrl}/catalog/team-sync`, { method: "POST" }),
   );
 }
 
@@ -56,7 +63,7 @@ export async function extract(projectName: string, files: File[]) {
   const form = new FormData();
   files.forEach((file) => form.append("files", file));
   return parsed<{ project_id: string; project_name: string; fixtures: Fixture[]; warnings: string[]; analysis_engine: "local_ai" | "rules" }>(
-    await fetch(`${BASE_URL}/extract?project_name=${encodeURIComponent(projectName)}`, {
+    await fetch(`${baseUrl}/extract?project_name=${encodeURIComponent(projectName)}`, {
       method: "POST",
       body: form,
     }),
@@ -65,7 +72,7 @@ export async function extract(projectName: string, files: File[]) {
 
 export async function approveFixtures(projectId: string, fixtures: Fixture[]) {
   return parsed<{ approved: number }>(
-    await fetch(`${BASE_URL}/projects/${encodeURIComponent(projectId)}/fixtures/approve`, {
+    await fetch(`${baseUrl}/projects/${encodeURIComponent(projectId)}/fixtures/approve`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ fixtures }),
@@ -74,7 +81,7 @@ export async function approveFixtures(projectId: string, fixtures: Fixture[]) {
 }
 
 export function evidenceUrl(path: string) {
-  return `http://127.0.0.1:8765${path}`;
+  return `${baseUrl.replace(/\/api$/, "")}${path}`;
 }
 
 export async function searchProducts(
@@ -84,7 +91,7 @@ export async function searchProducts(
   refresh = false,
 ) {
   return parsed<ProductSearchResponse>(
-    await fetch(`${BASE_URL}/products/search?refresh=${refresh}`, {
+    await fetch(`${baseUrl}/products/search?refresh=${refresh}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -97,7 +104,7 @@ export async function searchProducts(
 }
 
 export async function catalogStatus() {
-  return parsed<CatalogStatus>(await fetch(`${BASE_URL}/catalog/status`));
+  return parsed<CatalogStatus>(await fetch(`${baseUrl}/catalog/status`));
 }
 
 export async function browseCatalog(
@@ -105,7 +112,7 @@ export async function browseCatalog(
   brand: string,
   tolerances: { lumens_percent: number; wattage_percent: number },
 ) {
-  return parsed<CatalogBrowseResponse>(await fetch(`${BASE_URL}/catalog/browse`, {
+  return parsed<CatalogBrowseResponse>(await fetch(`${baseUrl}/catalog/browse`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -124,7 +131,7 @@ export async function catalogSearchStatus(fixture: Fixture, brand: string) {
     last_verified_at?: string | null;
     last_error?: string | null;
     products: number;
-  }>(await fetch(`${BASE_URL}/catalog/search-status`, {
+  }>(await fetch(`${baseUrl}/catalog/search-status`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ fixture, brand }),
@@ -138,7 +145,7 @@ export async function downloadQuote(
   reference: string,
   lines: QuoteLine[],
 ) {
-  const response = await fetch(`${BASE_URL}/quote/${format}`, {
+  const response = await fetch(`${baseUrl}/quote/${format}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ project_name: projectName, customer_name: customerName, reference, lines }),
@@ -160,7 +167,7 @@ export async function downloadCompliance(
 ) {
   try {
     return await parsed<{ saved: boolean; filename: string; path: string }>(
-      await fetch(`${BASE_URL}/compliance/${format}/save?filename=${encodeURIComponent(filename)}`, {
+      await fetch(`${baseUrl}/compliance/${format}/save?filename=${encodeURIComponent(filename)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ project, items }),
@@ -183,7 +190,7 @@ export async function downloadCommercial(
 ) {
   try {
     return await parsed<{ saved: boolean; filename: string; path: string }>(
-      await fetch(`${BASE_URL}/commercial/xlsx/save?filename=${encodeURIComponent(filename)}`, {
+      await fetch(`${baseUrl}/commercial/xlsx/save?filename=${encodeURIComponent(filename)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ project, items, currency, exchange_rates: exchangeRates }),

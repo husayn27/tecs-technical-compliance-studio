@@ -25,7 +25,7 @@ import {
   X,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { approveFixtures, browseCatalog, catalogSearchStatus, catalogStatus, chooseExportFolder, downloadCommercial, downloadCompliance, extract, getExportFolder, health, openExternalUrl, removeApiKey, saveApiKey, searchProducts, syncTeamCatalog, teamCatalogStatus } from "./api";
+import { approveFixtures, browseCatalog, catalogSearchStatus, catalogStatus, chooseExportFolder, downloadCommercial, downloadCompliance, extract, getExportFolder, health, initializeApiEndpoint, openExternalUrl, removeApiKey, saveApiKey, searchProducts, syncTeamCatalog, teamCatalogStatus } from "./api";
 import tecsLogo from "./assets/tecs-logo.png";
 import type { CatalogBrowseResponse, CatalogStatus, ComplianceItem, ComplianceRow, ComplianceStatus, Currency, Fixture, LegendRequirements, LocalAIStatus, Product, ProductSearchResponse, ProjectDetails, TeamCatalogStatus } from "./types";
 
@@ -124,6 +124,7 @@ const STORAGE_KEY = "tecs-compliance-draft-v2";
 const RECENT_PROJECTS_KEY = "tecs-compliance-recent-projects-v1";
 
 type SavedDraft = {
+  step?: number;
   project: ProjectDetails;
   items: ComplianceItem[];
   activeId: string;
@@ -144,11 +145,34 @@ type RecentProject = {
   client: string;
   reference: string;
   completedAt: string;
+  status?: "draft" | "completed";
   draft: SavedDraft;
 };
 
 function emptyProject(): ProjectDetails {
   return { project_name: "", client: "", consultant: "", contractor: "", reference: "" };
+}
+
+function normalizeSavedDraft(value: Partial<SavedDraft>): SavedDraft {
+  return {
+    step: value.step,
+    project: value.project || emptyProject(),
+    items: Array.isArray(value.items) ? value.items.map(normalizeItemBrand) : [],
+    activeId: value.activeId || "",
+    priceCurrency: CURRENCIES.includes(value.priceCurrency as Currency) ? value.priceCurrency as Currency : "OMR",
+    exchangeRateSets: { ...defaultExchangeRates(), ...(value.exchangeRateSets || {}) },
+    catalogFilters: value.catalogFilters || {},
+    catalogViews: value.catalogViews || {},
+    selectedMatches: value.selectedMatches || {},
+    searchResults: value.searchResults || {},
+    candidatePrices: value.candidatePrices || {},
+    candidateCurrencies: value.candidateCurrencies || {},
+    lastExportAt: value.lastExportAt || null,
+  };
+}
+
+function draftHasProjectData(draft: SavedDraft) {
+  return draft.items.length > 0 || Object.values(draft.project).some((value) => value.trim() !== "");
 }
 
 function savedRecentProjects(): RecentProject[] {
@@ -506,19 +530,23 @@ export default function App() {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) {
-        const draft = JSON.parse(raw);
-        if (draft.project) setProject(draft.project);
-        if (Array.isArray(draft.items)) setItems(draft.items.map(normalizeItemBrand));
-        if (draft.activeId) setActiveId(draft.activeId);
-        if (draft.catalogFilters) setCatalogFilters(draft.catalogFilters);
-        if (draft.catalogViews) setCatalogViews(draft.catalogViews);
-        if (draft.selectedMatches) setSelectedMatches(draft.selectedMatches);
-        if (draft.searchResults) setSearchResults(draft.searchResults);
-        if (draft.candidatePrices) setCandidatePrices(draft.candidatePrices);
-        if (draft.candidateCurrencies) setCandidateCurrencies(draft.candidateCurrencies);
-        if (draft.lastExportAt) setLastExportAt(draft.lastExportAt);
-        if (["OMR", "AED", "USD", "GBP", "EUR"].includes(draft.priceCurrency)) setPriceCurrency(draft.priceCurrency as Currency);
-        if (draft.exchangeRateSets) setExchangeRateSets({ ...defaultExchangeRates(), ...draft.exchangeRateSets });
+        const draft = normalizeSavedDraft(JSON.parse(raw));
+        if (draftHasProjectData(draft)) {
+          const recovered: RecentProject = {
+            id: crypto.randomUUID(),
+            projectName: draft.project.project_name.trim(),
+            client: draft.project.client.trim(),
+            reference: draft.project.reference.trim(),
+            completedAt: new Date().toISOString(),
+            status: "draft",
+            draft,
+          };
+          const nextRecent = [recovered, ...savedRecentProjects()].slice(0, 12);
+          localStorage.setItem(RECENT_PROJECTS_KEY, JSON.stringify(nextRecent));
+          setRecentProjects(nextRecent);
+          setSuccess("Your previous workspace was moved to Recent Projects. A new blank project is ready.");
+        }
+        localStorage.removeItem(STORAGE_KEY);
       }
     } catch {
       localStorage.removeItem(STORAGE_KEY);
@@ -546,7 +574,11 @@ export default function App() {
         else setServiceStatus("offline");
       }
     };
-    void checkService();
+    void initializeApiEndpoint().then(checkService).catch(() => {
+      if (cancelled) return;
+      setServiceStatus("offline");
+      setError("The packaged TECS engine could not be started. Close the app completely and open it again.");
+    });
     return () => {
       cancelled = true;
       if (retryTimer) window.clearTimeout(retryTimer);
@@ -560,8 +592,8 @@ export default function App() {
 
   useEffect(() => {
     if (!restored) return;
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ project, items, activeId, priceCurrency, exchangeRateSets, catalogFilters, catalogViews, selectedMatches, searchResults, candidatePrices, candidateCurrencies, lastExportAt }));
-  }, [project, items, activeId, priceCurrency, exchangeRateSets, catalogFilters, catalogViews, selectedMatches, searchResults, candidatePrices, candidateCurrencies, lastExportAt, restored]);
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ step, project, items, activeId, priceCurrency, exchangeRateSets, catalogFilters, catalogViews, selectedMatches, searchResults, candidatePrices, candidateCurrencies, lastExportAt }));
+  }, [step, project, items, activeId, priceCurrency, exchangeRateSets, catalogFilters, catalogViews, selectedMatches, searchResults, candidatePrices, candidateCurrencies, lastExportAt, restored]);
 
   const activeItem = items.find((item) => item.id === activeId) || items[0];
   const selectedItems = items.filter((item) => item.selected);
@@ -881,10 +913,14 @@ export default function App() {
   }
 
   function currentDraft(): SavedDraft {
-    return { project, items, activeId, priceCurrency, exchangeRateSets, catalogFilters, catalogViews, selectedMatches, searchResults, candidatePrices, candidateCurrencies, lastExportAt };
+    return { step, project, items, activeId, priceCurrency, exchangeRateSets, catalogFilters, catalogViews, selectedMatches, searchResults, candidatePrices, candidateCurrencies, lastExportAt };
   }
 
-  function restoreProject(draft: SavedDraft) {
+  function restoreProject(recent: RecentProject) {
+    const draft = normalizeSavedDraft(recent.draft);
+    const nextRecent = recentProjects.filter((candidate) => candidate.id !== recent.id);
+    localStorage.setItem(RECENT_PROJECTS_KEY, JSON.stringify(nextRecent));
+    setRecentProjects(nextRecent);
     setProject(draft.project || emptyProject());
     setItems((draft.items || []).map(normalizeItemBrand));
     setActiveId(draft.activeId || draft.items?.[0]?.id || "");
@@ -902,7 +938,8 @@ export default function App() {
     setWarnings([]);
     setError("");
     setSuccess("");
-    setStep(draft.items?.length ? 3 : 0);
+    const fallbackStep = recent.status !== "draft" ? 3 : draft.items.length ? 1 : 0;
+    setStep(Math.max(0, Math.min(3, draft.step ?? fallbackStep)));
   }
 
   function finishProjectAndStartNew() {
@@ -914,6 +951,7 @@ export default function App() {
       client: project.client.trim(),
       reference: project.reference.trim(),
       completedAt,
+      status: "completed",
       // Finalized product details live in `items`; transient catalogue cards can
       // be reloaded from the database and would make the local archive needlessly large.
       draft: { ...currentDraft(), catalogViews: {}, selectedMatches: {}, searchResults: {}, candidatePrices: {}, candidateCurrencies: {}, lastExportAt },
@@ -1054,7 +1092,7 @@ export default function App() {
                 <button className="secondary" disabled={!files.length || busy} onClick={processDrawings}>{busy ? <LoaderCircle className="spin" size={17} /> : <ArrowRight size={17} />}Extract first draft</button>
               </div>
             </div>
-            {recentProjects.length > 0 && <div className="recent-projects"><div className="recent-projects-heading"><div><span className="section-kicker">RECENT PROJECTS</span><h3>Reopen completed work</h3></div><small>Stored privately on this computer</small></div><div className="recent-project-list">{recentProjects.map((recent) => <article key={recent.id}><div><strong>{recentProjectTitle(recent)}</strong><span>{[recent.client ? `Client: ${recent.client}` : "", recent.reference ? `Reference: ${recent.reference}` : ""].filter(Boolean).join(" · ") || "No client or reference"}</span><small>{recent.draft.items.length} product{recent.draft.items.length === 1 ? "" : "s"} · Completed {new Date(recent.completedAt).toLocaleString()}</small></div><button className="secondary" onClick={() => restoreProject(recent.draft)}>Reopen</button></article>)}</div></div>}
+            {recentProjects.length > 0 && <div className="recent-projects"><div className="recent-projects-heading"><div><span className="section-kicker">RECENT PROJECTS</span><h3>Reopen previous work</h3></div><small>Stored privately on this computer</small></div><div className="recent-project-list">{recentProjects.map((recent) => <article key={recent.id}><div><strong>{recentProjectTitle(recent)}</strong><span>{[recent.client ? `Client: ${recent.client}` : "", recent.reference ? `Reference: ${recent.reference}` : ""].filter(Boolean).join(" · ") || "No client or reference"}</span><small>{recent.draft.items.length} product{recent.draft.items.length === 1 ? "" : "s"} · {recent.status === "draft" ? "Saved" : "Completed"} {new Date(recent.completedAt).toLocaleString()}</small></div><button className="secondary" onClick={() => restoreProject(recent)}>Reopen</button></article>)}</div></div>}
           </section>
         )}
 

@@ -53,7 +53,7 @@ The first development launch downloads roughly 5 GB of model files into the loca
 
 Both release builds package the local Python extraction/OCR service as a private sidecar. The user does not install Python, Node.js, OCR tools, or a database.
 
-- Push a version tag such as `v0.1.3` to build a normal NSIS `.exe` installer and attach it permanently to a GitHub Release.
+- Push a version tag such as `v0.1.4` to build a normal NSIS `.exe` installer and attach it permanently to a GitHub Release.
 - The `Windows installer` workflow can also be started manually for an internal test build; manual builds appear as temporary GitHub Actions artifacts.
 - Run the `macOS application` workflow for a drag-and-drop `.dmg` containing the `.app`.
 

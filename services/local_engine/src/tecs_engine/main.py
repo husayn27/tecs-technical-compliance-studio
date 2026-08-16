@@ -442,7 +442,8 @@ def save_commercial_xlsx(
 
 
 def run() -> None:
-    uvicorn.run(app, host="127.0.0.1", port=8765, log_level="info")
+    port = int(os.getenv("TECS_ENGINE_PORT", "8765"))
+    uvicorn.run(app, host="127.0.0.1", port=port, log_level="info")
 
 
 if __name__ == "__main__":
