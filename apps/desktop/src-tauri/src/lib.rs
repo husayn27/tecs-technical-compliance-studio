@@ -1,4 +1,4 @@
-use std::{net::TcpListener, sync::Mutex};
+use std::sync::Mutex;
 
 use tauri::{Manager, RunEvent, State};
 use tauri_plugin_shell::{process::CommandChild, ShellExt};
@@ -8,10 +8,16 @@ struct EngineState {
     child: Mutex<Option<CommandChild>>,
 }
 
+// Keep the packaged desktop engine on a version-specific, predictable port.
+// This gives the WebView a reliable fallback even if Tauri IPC initializes
+// slowly on a newly installed Windows machine. Development continues to use
+// port 8765.
+const PACKAGED_ENGINE_PORT: u16 = 18765;
+
 impl Default for EngineState {
     fn default() -> Self {
         Self {
-            endpoint: Mutex::new("http://127.0.0.1:8765".to_string()),
+            endpoint: Mutex::new(format!("http://127.0.0.1:{PACKAGED_ENGINE_PORT}")),
             child: Mutex::new(None),
         }
     }
@@ -31,20 +37,15 @@ pub fn run() {
         .setup(|app| {
             #[cfg(not(debug_assertions))]
             {
-                // A private per-launch port prevents a leftover engine from an older
-                // installation from being mistaken for the engine bundled with this UI.
-                let listener = TcpListener::bind("127.0.0.1:0")?;
-                let port = listener.local_addr()?.port();
-                drop(listener);
-
                 let sidecar = app
                     .shell()
                     .sidecar("tecs-engine")?
-                    .env("TECS_ENGINE_PORT", port.to_string())
+                    .env("TECS_ENGINE_PORT", PACKAGED_ENGINE_PORT.to_string())
                     .env("TECS_VISION_MODEL_REPOSITORY", "ggml-org/Qwen2.5-VL-7B-Instruct-GGUF:Q4_K_M");
                 let (_events, child) = sidecar.spawn()?;
                 let state = app.state::<EngineState>();
-                *state.endpoint.lock().unwrap() = format!("http://127.0.0.1:{port}");
+                *state.endpoint.lock().unwrap() =
+                    format!("http://127.0.0.1:{PACKAGED_ENGINE_PORT}");
                 *state.child.lock().unwrap() = Some(child);
             }
             Ok(())

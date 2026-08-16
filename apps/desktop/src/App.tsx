@@ -570,15 +570,14 @@ export default function App() {
         if (cancelled) return;
         attempts += 1;
         setLocalAI(null);
-        if (attempts < 45) retryTimer = window.setTimeout(checkService, 1000);
-        else setServiceStatus("offline");
+        if (attempts < 120) retryTimer = window.setTimeout(checkService, 1000);
+        else {
+          setServiceStatus("offline");
+          setError("The bundled TECS service did not start. Close the app completely and open it again. If this repeats, Windows Security may have blocked tecs-engine.exe.");
+        }
       }
     };
-    void initializeApiEndpoint().then(checkService).catch(() => {
-      if (cancelled) return;
-      setServiceStatus("offline");
-      setError("The packaged TECS engine could not be started. Close the app completely and open it again.");
-    });
+    void initializeApiEndpoint().then(checkService);
     return () => {
       cancelled = true;
       if (retryTimer) window.clearTimeout(retryTimer);

@@ -2,12 +2,20 @@ import type { CatalogBrowseResponse, CatalogStatus, ComplianceItem, Currency, Fi
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-shell";
 
-let baseUrl = "http://127.0.0.1:8765/api";
+// The packaged Windows app uses a predictable version-specific port. Keeping
+// this fallback in the frontend prevents a delayed IPC handshake from leaving
+// the settings screen permanently stuck on "Connecting".
+let baseUrl = isTauri() ? "http://127.0.0.1:18765/api" : "http://127.0.0.1:8765/api";
 
 export async function initializeApiEndpoint() {
   if (isTauri()) {
-    const endpoint = await invoke<string>("engine_endpoint");
-    baseUrl = `${endpoint.replace(/\/$/, "")}/api`;
+    try {
+      const endpoint = await invoke<string>("engine_endpoint");
+      baseUrl = `${endpoint.replace(/\/$/, "")}/api`;
+    } catch {
+      // The fixed packaged endpoint above remains usable while Tauri IPC is
+      // still settling on first launch.
+    }
   }
 }
 
