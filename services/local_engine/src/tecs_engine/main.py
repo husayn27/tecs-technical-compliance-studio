@@ -15,8 +15,8 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 
-from .catalog import CatalogService
 from . import __version__
+from .catalog import CatalogService
 from .commercial import build_commercial_xlsx
 from .compliance import build_compliance_pdf, build_compliance_xlsx
 from .extractor import extract_pdf_detailed
@@ -29,17 +29,21 @@ from .models import (
     FixtureApprovalRequest,
     ProductSearchRequest,
     QuoteRequest,
+    TeamProjectSaveRequest,
+    TeamWorkspaceKeyRequest,
     TechnicalSheetRequest,
 )
 from .product_search import delete_api_key, has_api_key, save_api_key
 from .quote import build_pdf, build_xlsx
 from .shared_catalog import SharedCatalogService
 from .storage import KnowledgeStore
+from .team_projects import TeamProjectError, TeamProjectService
 
 app = FastAPI(title="TECS Lighting Engine", version=__version__)
 knowledge = KnowledgeStore()
 shared_catalog = SharedCatalogService(knowledge)
 catalog = CatalogService(knowledge, on_catalog_updated=shared_catalog.product_saved)
+team_projects = TeamProjectService()
 
 
 def _settings_path() -> Path:
@@ -166,6 +170,7 @@ def health() -> dict:
         "engine_version": app.version,
         "catalog_api": True,
         "api_key_configured": has_api_key(),
+        "team_projects_configured": team_projects.configured(),
         "local_ai": local_ai_runtime.status().model_dump(),
     }
 
@@ -196,6 +201,43 @@ def sync_team_catalog() -> dict:
         return shared_catalog.sync()
     except RuntimeError as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
+
+
+def _team_project_call(callback):
+    try:
+        return callback()
+    except TeamProjectError as error:
+        raise HTTPException(status_code=error.status_code, detail=str(error)) from error
+
+
+@app.get("/api/settings/team-projects")
+def team_projects_status() -> dict:
+    return team_projects.status()
+
+
+@app.post("/api/settings/team-projects")
+def configure_team_projects(request: TeamWorkspaceKeyRequest) -> dict:
+    return _team_project_call(lambda: team_projects.configure(request.workspace_key))
+
+
+@app.delete("/api/settings/team-projects")
+def remove_team_projects_key() -> dict:
+    return _team_project_call(team_projects.remove_key)
+
+
+@app.get("/api/team-projects")
+def list_team_projects() -> list[dict]:
+    return _team_project_call(team_projects.list_projects)
+
+
+@app.get("/api/team-projects/{project_id}")
+def get_team_project(project_id: str) -> dict:
+    return _team_project_call(lambda: team_projects.get_project(project_id))
+
+
+@app.post("/api/team-projects")
+def save_team_project(request: TeamProjectSaveRequest) -> dict:
+    return _team_project_call(lambda: team_projects.save_project(request.model_dump()))
 
 
 @app.post("/api/catalog/search-status")

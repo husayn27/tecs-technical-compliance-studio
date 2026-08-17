@@ -28,7 +28,77 @@ async function parsed<T>(response: Response): Promise<T> {
 }
 
 export async function health() {
-  return parsed<{ status: string; engine_version?: string; catalog_api?: boolean; api_key_configured: boolean; local_ai: LocalAIStatus }>(await fetch(`${baseUrl}/health`));
+  return parsed<{ status: string; engine_version?: string; catalog_api?: boolean; api_key_configured: boolean; team_projects_configured?: boolean; local_ai: LocalAIStatus }>(await fetch(`${baseUrl}/health`));
+}
+
+export type TeamProjectSummary = {
+  id: string;
+  project_name: string;
+  client: string;
+  consultant: string;
+  contractor: string;
+  reference: string;
+  status: "pending" | "complete";
+  progress: number;
+  missing_fields: string[];
+  item_count: number;
+  revision: number;
+  created_at: string;
+  updated_at: string;
+  completed_at?: string | null;
+};
+
+export type TeamProjectRecord = TeamProjectSummary & { draft: Record<string, unknown> };
+
+export async function teamProjectsStatus() {
+  return parsed<{ configured: boolean }>(await fetch(`${baseUrl}/settings/team-projects`));
+}
+
+export async function saveTeamWorkspaceKey(workspaceKey: string) {
+  return parsed<{ saved: boolean; configured: boolean; projects: number }>(
+    await fetch(`${baseUrl}/settings/team-projects`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ workspace_key: workspaceKey }),
+    }),
+  );
+}
+
+export async function removeTeamWorkspaceKey() {
+  return parsed<{ removed: boolean; configured: boolean }>(
+    await fetch(`${baseUrl}/settings/team-projects`, { method: "DELETE" }),
+  );
+}
+
+export async function listTeamProjects() {
+  return parsed<TeamProjectSummary[]>(await fetch(`${baseUrl}/team-projects`));
+}
+
+export async function getTeamProject(projectId: string) {
+  return parsed<TeamProjectRecord>(await fetch(`${baseUrl}/team-projects/${encodeURIComponent(projectId)}`));
+}
+
+export async function saveTeamProject(payload: {
+  id?: string;
+  expected_revision?: number;
+  project_name: string;
+  client: string;
+  consultant: string;
+  contractor: string;
+  reference: string;
+  status: "pending" | "complete";
+  progress: number;
+  missing_fields: string[];
+  item_count: number;
+  draft: Record<string, unknown>;
+}) {
+  return parsed<TeamProjectRecord>(
+    await fetch(`${baseUrl}/team-projects`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+  );
 }
 
 export async function saveApiKey(apiKey: string) {
@@ -97,6 +167,7 @@ export async function searchProducts(
   brand: string,
   tolerances: { lumens_percent: number; wattage_percent: number },
   refresh = false,
+  maxResults = 5,
 ) {
   return parsed<ProductSearchResponse>(
     await fetch(`${baseUrl}/products/search?refresh=${refresh}`, {
@@ -105,6 +176,7 @@ export async function searchProducts(
       body: JSON.stringify({
         fixture,
         brand,
+        max_results: maxResults,
         tolerances: { ...tolerances, dimensions_percent: 15 },
       }),
     }),
@@ -194,6 +266,7 @@ export async function downloadCommercial(
   items: ComplianceItem[],
   currency: Currency,
   exchangeRates: Partial<Record<Currency, number>>,
+  freightPercent: number,
   filename = "TECS-Commercial-Quotation",
 ) {
   try {
@@ -201,7 +274,7 @@ export async function downloadCommercial(
       await fetch(`${baseUrl}/commercial/xlsx/save?filename=${encodeURIComponent(filename)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ project, items, currency, exchange_rates: exchangeRates }),
+        body: JSON.stringify({ project, items, currency, exchange_rates: exchangeRates, freight_percent: freightPercent }),
       }),
     );
   } catch (error) {

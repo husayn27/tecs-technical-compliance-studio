@@ -367,6 +367,7 @@ def _product_schema(max_items: int = 5) -> dict:
                         "brand": {"type": "string"},
                         "product_name": {"type": "string"},
                         "product_code": {"type": ["string", "null"]},
+                        "model_number": {"type": ["string", "null"]},
                         "product_url": {"type": "string"},
                         "datasheet_url": {"type": ["string", "null"]},
                         "image_url": {"type": ["string", "null"]},
@@ -426,7 +427,7 @@ def _product_schema(max_items: int = 5) -> dict:
                         },
                     },
                     "required": [
-                        "brand", "product_name", "product_code", "product_url", "datasheet_url",
+                        "brand", "product_name", "product_code", "model_number", "product_url", "datasheet_url",
                         "image_url", "manufacturer_updated_at", "evidence_urls", "description", "specifications",
                     ],
                     "additionalProperties": False,
@@ -652,7 +653,7 @@ Complete a second-pass, evidence-based technical verification for {profile.offic
 Deeply inspect the official product pages, configuration/order tables, linked technical
 downloads, and PDFs for the discovered candidates. Also continue searching the official
 catalog in case the discovery pass missed a better category-compatible option. Return up
-to 5 distinct, current, orderable configurations and extract variant-level specifications.
+to {request.max_results} distinct, current, orderable configurations and extract variant-level specifications.
 
 Requirement JSON:
 {json.dumps(fixture, indent=2)}
@@ -676,6 +677,10 @@ Verification rules:
   CCT, optics, controls, emergency, protection, and dimensions to the exact order code.
 - If an exact variant cannot be identified, product_code must be null and uncertain
   specification fields must be null. Never assemble a fictional order code.
+- model_number is the manufacturer's human-readable model/configuration designation. For
+  Signify, it MUST be the exact value labelled "Order product name" (or "Full product name")
+  in the official datasheet, never the numeric Order code, 12NC, EAN, or material number.
+  Keep the numeric Signify Order code in product_code so catalogue identity remains stable.
 - Prefer product_url as the exact product/configuration page. Put the technical PDF in
   datasheet_url and list every official page actually used in evidence_urls.
 - manufacturer_updated_at is the most recent explicit manufacturer-issued product-page
@@ -699,7 +704,7 @@ Verification rules:
 - Do not invent specifications. Use unknown when the official page does not state a value.
 - Keep different order codes when they represent genuinely different configurations.
 - Do not return the same order code or product page more than once.
-- Return no more than five distinct products.
+- Return no more than {request.max_results} distinct products.
 """.strip()
 
     input_content: list[dict] = [{"type": "input_text", "text": verification_prompt}]
@@ -732,7 +737,7 @@ Verification rules:
                     "type": "json_schema",
                     "name": "lighting_product_matches",
                     "strict": True,
-                    "schema": _product_schema(),
+                    "schema": _product_schema(request.max_results),
                 }
             },
             store=False,
@@ -779,6 +784,7 @@ Verification rules:
                 brand=item["brand"],
                 product_name=item["product_name"],
                 product_code=item.get("product_code"),
+                model_number=item.get("model_number"),
                 product_url=product_url,
                 datasheet_url=datasheet_url,
                 image_url=_official_url(
@@ -797,7 +803,7 @@ Verification rules:
         )
     matches.sort(key=lambda product: product.score, reverse=True)
     return ProductSearchResponse(
-        matches=matches[:5],
+        matches=matches[:request.max_results],
         searched_domain=approved_domain,
         warnings=warnings,
         usage=_combine_usage(discovery_usage, verification_usage),

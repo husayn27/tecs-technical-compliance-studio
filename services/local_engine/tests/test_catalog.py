@@ -89,6 +89,39 @@ def test_catalog_persists_and_reranks_without_research(tmp_path) -> None:
     assert response.matches[0].score > 90
 
 
+def test_catalog_respects_requested_per_brand_result_limit(tmp_path) -> None:
+    store = KnowledgeStore(tmp_path)
+    request = ProductSearchRequest(fixture=fixture(), brand="LuxeLED", max_results=2)
+    scope = _scope_key(request.brand, request.fixture)
+    products = [
+        product().model_copy(update={"id": f"product-{index}", "product_code": f"MODEL-{index}"})
+        for index in range(5)
+    ]
+    store.replace_catalog_scope(
+        scope,
+        request.brand,
+        request.fixture,
+        products,
+        datetime.now(UTC).isoformat(),
+        None,
+    )
+
+    response = CatalogService(store).search(request)
+
+    assert len(response.matches) == 2
+
+
+def test_product_keeps_order_code_and_human_readable_model_separately() -> None:
+    signify = product().model_copy(update={
+        "brand": "Signify",
+        "product_code": "911401897484",
+        "model_number": "RC035B LED40S/840 120-277 W60L60 LA",
+    })
+
+    assert signify.product_code == "911401897484"
+    assert signify.model_number == "RC035B LED40S/840 120-277 W60L60 LA"
+
+
 def test_catalogue_default_freshness_is_ninety_days(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("TECS_CATALOG_FRESHNESS_DAYS", raising=False)
     assert CatalogService(KnowledgeStore(tmp_path)).freshness_days == 90

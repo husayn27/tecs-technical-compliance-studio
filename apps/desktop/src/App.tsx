@@ -10,6 +10,7 @@ import {
   FileSpreadsheet,
   FileText,
   FolderOpen,
+  FolderKanban,
   LoaderCircle,
   KeyRound,
   Minus,
@@ -25,7 +26,8 @@ import {
   X,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { approveFixtures, browseCatalog, catalogSearchStatus, catalogStatus, chooseExportFolder, downloadCommercial, downloadCompliance, extract, getExportFolder, health, initializeApiEndpoint, openExternalUrl, removeApiKey, saveApiKey, searchProducts, syncTeamCatalog, teamCatalogStatus } from "./api";
+import { approveFixtures, browseCatalog, catalogSearchStatus, catalogStatus, chooseExportFolder, downloadCommercial, downloadCompliance, extract, getExportFolder, getTeamProject, health, initializeApiEndpoint, listTeamProjects, openExternalUrl, removeApiKey, removeTeamWorkspaceKey, saveApiKey, saveTeamProject, saveTeamWorkspaceKey, searchProducts, syncTeamCatalog, teamCatalogStatus } from "./api";
+import type { TeamProjectRecord, TeamProjectSummary } from "./api";
 import tecsLogo from "./assets/tecs-logo.png";
 import type { CatalogBrowseResponse, CatalogStatus, ComplianceItem, ComplianceRow, ComplianceStatus, Currency, Fixture, LegendRequirements, LocalAIStatus, Product, ProductSearchResponse, ProjectDetails, TeamCatalogStatus } from "./types";
 
@@ -65,6 +67,21 @@ const BRAND_ALIASES: Record<string, string> = {
 function canonicalBrand(value: string) {
   const cleaned = (value || "").trim().replace(/\s+/g, " ");
   return BRAND_ALIASES[cleaned.toLowerCase()] || cleaned;
+}
+
+function comparisonResultLimit(brandCount: number) {
+  if (brandCount <= 1) return 5;
+  return brandCount === 2 ? 3 : 2;
+}
+
+function mergeBrandProducts(existing: Product[], brandName: string, incoming: Product[], limit: number, brandOrder: string[]) {
+  const target = canonicalBrand(brandName);
+  const retained = existing.filter((product) => canonicalBrand(product.brand) !== target);
+  const merged = [...retained, ...incoming.slice(0, limit)];
+  return merged.sort((left, right) => {
+    const brandDifference = brandOrder.indexOf(canonicalBrand(left.brand)) - brandOrder.indexOf(canonicalBrand(right.brand));
+    return brandDifference || right.score - left.score;
+  });
 }
 
 function normalizeItemBrand(item: ComplianceItem): ComplianceItem {
@@ -130,13 +147,18 @@ type SavedDraft = {
   activeId: string;
   priceCurrency: Currency;
   exchangeRateSets: ExchangeRateSets;
+  freightPercent?: number;
   catalogFilters: Record<string, CatalogFilters>;
   catalogViews: Record<string, "closed" | "saved" | "api">;
   selectedMatches: Record<string, string>;
   searchResults: Record<string, Product[]>;
+  comparisonCounts?: Record<string, number>;
+  comparisonBrands?: Record<string, string[]>;
   candidatePrices: Record<string, string>;
   candidateCurrencies: Record<string, Currency>;
   lastExportAt: string | null;
+  teamProjectId?: string;
+  teamProjectRevision?: number;
 };
 
 type RecentProject = {
@@ -161,13 +183,18 @@ function normalizeSavedDraft(value: Partial<SavedDraft>): SavedDraft {
     activeId: value.activeId || "",
     priceCurrency: CURRENCIES.includes(value.priceCurrency as Currency) ? value.priceCurrency as Currency : "OMR",
     exchangeRateSets: { ...defaultExchangeRates(), ...(value.exchangeRateSets || {}) },
+    freightPercent: Number.isFinite(value.freightPercent) ? Math.max(0, Number(value.freightPercent)) : 15,
     catalogFilters: value.catalogFilters || {},
     catalogViews: value.catalogViews || {},
     selectedMatches: value.selectedMatches || {},
     searchResults: value.searchResults || {},
+    comparisonCounts: value.comparisonCounts || {},
+    comparisonBrands: value.comparisonBrands || {},
     candidatePrices: value.candidatePrices || {},
     candidateCurrencies: value.candidateCurrencies || {},
     lastExportAt: value.lastExportAt || null,
+    teamProjectId: value.teamProjectId || undefined,
+    teamProjectRevision: value.teamProjectRevision || undefined,
   };
 }
 
@@ -197,6 +224,39 @@ function projectExportName(project: ProjectDetails, documentType: string) {
 
 function recentProjectTitle(recent: RecentProject) {
   return [recent.reference, recent.projectName].filter(Boolean).join(" — ") || "Untitled project";
+}
+
+function projectCompletion(draft: SavedDraft) {
+  const missing: string[] = [];
+  const requiredProject: Array<[keyof ProjectDetails, string]> = [
+    ["project_name", "Project name"],
+    ["client", "Client"],
+    ["consultant", "Consultant"],
+    ["contractor", "Contractor"],
+    ["reference", "Reference"],
+  ];
+  requiredProject.forEach(([key, label]) => {
+    if (!String(draft.project[key] || "").trim()) missing.push(label);
+  });
+  if (!draft.items.length) missing.push("At least one product");
+  draft.items.forEach((item, index) => {
+    const label = item.fitting_type.trim() || `Item ${index + 1}`;
+    if (!item.fitting_type.trim()) missing.push(`${label}: fitting type`);
+    if (item.quantity <= 0) missing.push(`${label}: quantity`);
+    if (!item.brand.trim()) missing.push(`${label}: brand`);
+    if (!item.product_name.trim()) missing.push(`${label}: selected product`);
+    if (!item.model_no.trim()) missing.push(`${label}: model number`);
+    const pending = item.rows.filter((row) => row.status === "pending").length;
+    if (pending) missing.push(`${label}: ${pending} pending compliance field${pending === 1 ? "" : "s"}`);
+  });
+  const checks = 6 + draft.items.length * 6;
+  const completed = Math.max(0, checks - missing.length);
+  const progress = Math.max(0, Math.min(100, Math.round((completed / Math.max(1, checks)) * 100)));
+  return {
+    status: draft.lastExportAt && missing.length === 0 ? "complete" as const : "pending" as const,
+    progress,
+    missingFields: missing,
+  };
 }
 
 function emptyRows(): ComplianceRow[] {
@@ -400,7 +460,7 @@ function applyProduct(item: ComplianceItem, product: Product): ComplianceItem {
     Description: product.description,
     Make: brand,
     "Country of Origin": specs.country_of_origin || "",
-    "Model No": product.product_code || "",
+    "Model No": product.model_number || product.product_code || "",
     Mounting: specs.mounting || "",
     "Housing / Construction": specs.construction || "",
     "Reflector / Optical System": specs.optical_details || "",
@@ -430,7 +490,7 @@ function applyProduct(item: ComplianceItem, product: Product): ComplianceItem {
     brand,
     product_name: product.product_name,
     country_of_origin: specs.country_of_origin || "",
-    model_no: product.product_code || "",
+    model_no: product.model_number || product.product_code || "",
     product_url: product.product_url,
     datasheet_url: product.datasheet_url || "",
     rows: item.rows.map((row) => {
@@ -497,11 +557,26 @@ export default function App() {
   const [apiKey, setApiKey] = useState("");
   const [apiSettingsOpen, setApiSettingsOpen] = useState(false);
   const [apiSettingsMessage, setApiSettingsMessage] = useState("");
-  const [settingsTab, setSettingsTab] = useState<"api" | "team">("api");
+  const [settingsTab, setSettingsTab] = useState<"api" | "team" | "projects">("api");
   const [teamCatalog, setTeamCatalog] = useState<TeamCatalogStatus | null>(null);
   const [teamMessage, setTeamMessage] = useState("");
+  const [teamProjectsConfigured, setTeamProjectsConfigured] = useState(false);
+  const [teamWorkspaceKey, setTeamWorkspaceKey] = useState("");
+  const [showTeamCodeEditor, setShowTeamCodeEditor] = useState(false);
+  const [teamProjectsMessage, setTeamProjectsMessage] = useState("");
+  const [teamProjects, setTeamProjects] = useState<TeamProjectSummary[]>([]);
+  const [teamProjectsLoading, setTeamProjectsLoading] = useState(false);
+  const [teamProjectsTab, setTeamProjectsTab] = useState<"pending" | "complete">("pending");
+  const [teamProjectId, setTeamProjectId] = useState("");
+  const [teamProjectRevision, setTeamProjectRevision] = useState<number | undefined>();
+  const [teamSaveState, setTeamSaveState] = useState<"idle" | "saving" | "saved" | "conflict">("idle");
+  const teamProjectIdentity = useRef<{ id: string; revision?: number }>({ id: "" });
+  const loadingTeamProject = useRef(false);
+  const lastTeamSignature = useRef("");
   const [searching, setSearching] = useState("");
   const [searchResults, setSearchResults] = useState<Record<string, Product[]>>({});
+  const [comparisonCounts, setComparisonCounts] = useState<Record<string, number>>({});
+  const [comparisonBrands, setComparisonBrands] = useState<Record<string, string[]>>({});
   const [catalogBrowseInfo, setCatalogBrowseInfo] = useState<Record<string, CatalogBrowseResponse>>({});
   const [catalogFilters, setCatalogFilters] = useState<Record<string, CatalogFilters>>({});
   const [catalogViews, setCatalogViews] = useState<Record<string, "closed" | "saved" | "api">>({});
@@ -517,6 +592,7 @@ export default function App() {
   const [candidateCurrencies, setCandidateCurrencies] = useState<Record<string, Currency>>({});
   const [priceCurrency, setPriceCurrency] = useState<Currency>("OMR");
   const [exchangeRateSets, setExchangeRateSets] = useState<ExchangeRateSets>(defaultExchangeRates);
+  const [freightPercent, setFreightPercent] = useState(15);
   const [lastExportAt, setLastExportAt] = useState<string | null>(null);
   const [recentProjects, setRecentProjects] = useState<RecentProject[]>(savedRecentProjects);
   const [exportFolder, setExportFolder] = useState("");
@@ -561,10 +637,12 @@ export default function App() {
         if (cancelled) return;
         setLocalAI(value.local_ai);
         setApiReady(value.api_key_configured);
+        setTeamProjectsConfigured(value.team_projects_configured === true);
         setServiceStatus("ready");
         setCatalogApiReady(value.catalog_api === true);
         if (value.catalog_api === true) void catalogStatus().then(setCatalogInfo).catch(() => undefined);
         void teamCatalogStatus().then(setTeamCatalog).catch(() => undefined);
+        if (value.team_projects_configured === true) void refreshTeamProjects();
         void getExportFolder().then((folder) => setExportFolder(folder.path)).catch(() => undefined);
       } catch {
         if (cancelled) return;
@@ -591,14 +669,23 @@ export default function App() {
 
   useEffect(() => {
     if (!restored) return;
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ step, project, items, activeId, priceCurrency, exchangeRateSets, catalogFilters, catalogViews, selectedMatches, searchResults, candidatePrices, candidateCurrencies, lastExportAt }));
-  }, [step, project, items, activeId, priceCurrency, exchangeRateSets, catalogFilters, catalogViews, selectedMatches, searchResults, candidatePrices, candidateCurrencies, lastExportAt, restored]);
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ step, project, items, activeId, priceCurrency, exchangeRateSets, freightPercent, catalogFilters, catalogViews, selectedMatches, searchResults, comparisonCounts, comparisonBrands, candidatePrices, candidateCurrencies, lastExportAt, teamProjectId, teamProjectRevision }));
+  }, [step, project, items, activeId, priceCurrency, exchangeRateSets, freightPercent, catalogFilters, catalogViews, selectedMatches, searchResults, comparisonCounts, comparisonBrands, candidatePrices, candidateCurrencies, lastExportAt, teamProjectId, teamProjectRevision, restored]);
+
+  useEffect(() => {
+    if (!restored || !teamProjectsConfigured || loadingTeamProject.current || !project.project_name.trim()) return;
+    const timer = window.setTimeout(() => void persistTeamDraft(), 1600);
+    return () => window.clearTimeout(timer);
+  }, [restored, teamProjectsConfigured, step, project, items, activeId, priceCurrency, exchangeRateSets, freightPercent, lastExportAt]);
 
   const activeItem = items.find((item) => item.id === activeId) || items[0];
   const selectedItems = items.filter((item) => item.selected);
   const activeCatalog = activeItem ? catalogBrowseInfo[activeItem.id] : undefined;
   const catalogView = activeItem ? catalogViews[activeItem.id] || "closed" : "closed";
   const activeCatalogFilters = activeItem ? catalogFilters[activeItem.id] || DEFAULT_CATALOG_FILTERS : DEFAULT_CATALOG_FILTERS;
+  const activeComparisonCount = activeItem ? comparisonCounts[activeItem.id] || 1 : 1;
+  const activeComparisonBrands = activeItem ? comparisonBrands[activeItem.id] || [canonicalBrand(activeItem.brand)] : [];
+  const comparisonReady = activeComparisonBrands.length === activeComparisonCount && activeComparisonBrands.every(Boolean) && new Set(activeComparisonBrands.map(canonicalBrand)).size === activeComparisonCount;
   const catalogOptions = useMemo(() => {
     const products = activeCatalog?.products || [];
     const unique = (values: Array<string | null | undefined>) => [...new Set(values.filter((value): value is string => Boolean(value?.trim())).map((value) => value.trim()))].sort((left, right) => left.localeCompare(right, undefined, { numeric: true }));
@@ -647,6 +734,40 @@ export default function App() {
 
   function setItemCatalogView(id: string, view: "closed" | "saved" | "api") {
     setCatalogViews((current) => ({ ...current, [id]: view }));
+  }
+
+  function updateComparisonCount(item: ComplianceItem, count: number) {
+    setComparisonCounts((current) => ({ ...current, [item.id]: count }));
+    setComparisonBrands((current) => {
+      const existing = current[item.id] || [canonicalBrand(item.brand)];
+      return { ...current, [item.id]: Array.from({ length: count }, (_, index) => existing[index] || "") };
+    });
+    setSearchResults((current) => ({ ...current, [item.id]: [] }));
+    setItemCatalogView(item.id, "closed");
+  }
+
+  function updateComparisonBrand(item: ComplianceItem, index: number, value: string) {
+    setComparisonBrands((current) => {
+      const count = comparisonCounts[item.id] || 1;
+      const existing = current[item.id] || [canonicalBrand(item.brand)];
+      const next = Array.from({ length: count }, (_, slot) => existing[slot] || "");
+      next[index] = canonicalBrand(value);
+      return { ...current, [item.id]: next };
+    });
+    setSearchResults((current) => ({ ...current, [item.id]: [] }));
+    setItemCatalogView(item.id, "closed");
+  }
+
+  function removeComparisonBrand(item: ComplianceItem, index: number) {
+    const count = comparisonCounts[item.id] || 1;
+    if (count <= 1) return;
+    setComparisonCounts((current) => ({ ...current, [item.id]: count - 1 }));
+    setComparisonBrands((current) => {
+      const existing = current[item.id] || [canonicalBrand(item.brand)];
+      return { ...current, [item.id]: existing.filter((_, slot) => slot !== index) };
+    });
+    setSearchResults((current) => ({ ...current, [item.id]: [] }));
+    setItemCatalogView(item.id, "closed");
   }
 
   function updateCatalogFilter(id: string, key: keyof CatalogFilters, value: string) {
@@ -833,14 +954,54 @@ export default function App() {
     finally { setBusy(false); }
   }
 
+  async function configureTeamProjects() {
+    if (!teamWorkspaceKey.trim() || serviceStatus !== "ready") return;
+    setBusy(true);
+    setTeamProjectsMessage("");
+    try {
+      await saveTeamWorkspaceKey(teamWorkspaceKey.trim());
+      setTeamWorkspaceKey("");
+      setTeamProjectsConfigured(true);
+      await refreshTeamProjects();
+      setShowTeamCodeEditor(false);
+      setTeamProjectsMessage("Team workspace connected successfully.");
+    } catch (caught) {
+      setTeamProjectsMessage(caught instanceof Error ? caught.message : "Could not connect the team workspace.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function clearTeamProjectsKey() {
+    setBusy(true);
+    setTeamProjectsMessage("");
+    try {
+      await removeTeamWorkspaceKey();
+      setTeamWorkspaceKey("");
+      setShowTeamCodeEditor(false);
+      setTeamProjectsConfigured(false);
+      setTeamProjects([]);
+      setTeamProjectsMessage("Team workspace disconnected from this computer. Shared projects were not deleted.");
+    } catch (caught) {
+      setTeamProjectsMessage(caught instanceof Error ? caught.message : "Could not disconnect the team workspace.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
 
   async function findBestProducts(item: ComplianceItem) {
     if (!catalogApiReady) {
       setError("The catalogue engine has not restarted yet. Stop and restart the TECS app, then search again; no API search was started.");
       return;
     }
-    const itemBrand = canonicalBrand(item.brand);
-    const brand = BRANDS.find((candidate) => candidate.name === itemBrand) || BRANDS[0];
+    const brandCount = comparisonCounts[item.id] || 1;
+    const requestedBrands = (comparisonBrands[item.id] || [canonicalBrand(item.brand)]).slice(0, brandCount).map(canonicalBrand);
+    if (requestedBrands.length !== brandCount || requestedBrands.some((brand) => !brand) || new Set(requestedBrands).size !== brandCount) {
+      setError("Choose a different approved brand in every comparison field before searching.");
+      return;
+    }
+    const resultLimit = comparisonResultLimit(brandCount);
     setSearching(item.id);
     setError("");
     setWarnings([]);
@@ -848,18 +1009,24 @@ export default function App() {
     setSelectedMatches((current) => ({ ...current, [item.id]: "" }));
     setFailedSearches((current) => ({ ...current, [item.id]: false }));
     try {
-      const response = await searchProducts(itemToFixture(item), brand.name, searchTolerance, true);
-      setSearchResults((current) => ({ ...current, [item.id]: response.matches }));
+      const attempts = await Promise.allSettled(requestedBrands.map((brand) => searchProducts(itemToFixture(item), brand, searchTolerance, true, resultLimit)));
+      const successful = attempts.flatMap((attempt, index) => attempt.status === "fulfilled" ? [{ brand: requestedBrands[index], response: attempt.value }] : []);
+      const failedWarnings = attempts.flatMap((attempt, index) => attempt.status === "rejected" ? [`${requestedBrands[index]} search failed: ${attempt.reason instanceof Error ? attempt.reason.message : "official catalogue unavailable"}`] : []);
+      const matches = successful.flatMap(({ brand, response }) => response.matches.slice(0, resultLimit).map((product) => ({ ...product, brand: canonicalBrand(product.brand || brand) })));
+      const combinedWarnings = [...successful.flatMap(({ response }) => response.warnings), ...failedWarnings];
+      const isRefreshing = successful.some(({ response }) => response.refreshing);
+      setSearchResults((current) => ({ ...current, [item.id]: matches }));
       setItemCatalogView(item.id, "api");
-      setSearchInfo((current) => ({ ...current, [item.id]: response }));
-      setRefreshingCatalogs((current) => ({ ...current, [item.id]: response.refreshing }));
+      if (successful[0]) setSearchInfo((current) => ({ ...current, [item.id]: { ...successful[0].response, matches, warnings: combinedWarnings, refreshing: isRefreshing } }));
+      setRefreshingCatalogs((current) => ({ ...current, [item.id]: isRefreshing }));
       void catalogStatus().then(setCatalogInfo).catch(() => undefined);
-      await loadSavedCatalog(item, brand.name);
-      if (response.refreshing) void pollCatalog(item, brand.name);
-      if (!response.matches.length && !response.refreshing) {
+      successful.forEach(({ brand, response }) => {
+        if (response.refreshing) void pollCatalog(item, brand, resultLimit, requestedBrands);
+      });
+      if (!matches.length && !isRefreshing) {
         setFailedSearches((current) => ({ ...current, [item.id]: true }));
-        setWarnings(response.warnings.length ? response.warnings : [`No verified ${brand.name} options are catalogued for this category yet. You can continue working and retry the background refresh later.`]);
-      } else if (response.warnings.length) setWarnings(response.warnings);
+        setWarnings(combinedWarnings.length ? combinedWarnings : [`No verified options are catalogued for the selected brands and category yet. You can continue working and retry the background refresh later.`]);
+      } else if (combinedWarnings.length) setWarnings(combinedWarnings);
     } catch (caught) {
       setFailedSearches((current) => ({ ...current, [item.id]: true }));
       setError(caught instanceof Error ? caught.message : "The product search could not be completed.");
@@ -868,10 +1035,11 @@ export default function App() {
     }
   }
 
-  async function pollCatalog(item: ComplianceItem, brandName: string) {
+  async function pollCatalog(item: ComplianceItem, brandName: string, resultLimit = 5, brandOrder = [brandName]) {
     brandName = canonicalBrand(brandName);
-    if (catalogPolls.current.has(item.id)) return;
-    catalogPolls.current.add(item.id);
+    const pollKey = `${item.id}:${brandName}`;
+    if (catalogPolls.current.has(pollKey)) return;
+    catalogPolls.current.add(pollKey);
     const startedAt = Date.now();
     try {
       let scopeStatus;
@@ -879,14 +1047,13 @@ export default function App() {
         await new Promise((resolve) => window.setTimeout(resolve, 3000));
         scopeStatus = await catalogSearchStatus(itemToFixture(item), brandName);
       } while (scopeStatus.refreshing && Date.now() - startedAt < 5 * 60 * 1000);
-      const response = await searchProducts(itemToFixture(item), brandName, searchTolerance);
-      setSearchResults((current) => ({ ...current, [item.id]: response.matches }));
+      const response = await searchProducts(itemToFixture(item), brandName, searchTolerance, false, resultLimit);
+      setSearchResults((current) => ({ ...current, [item.id]: mergeBrandProducts(current[item.id] || [], brandName, response.matches, resultLimit, brandOrder) }));
       setItemCatalogView(item.id, "api");
       setSearchInfo((current) => ({ ...current, [item.id]: response }));
       setRefreshingCatalogs((current) => ({ ...current, [item.id]: response.refreshing }));
       setWarnings(response.warnings);
       void catalogStatus().then(setCatalogInfo).catch(() => undefined);
-      await loadSavedCatalog(item, brandName);
       if (!response.matches.length && !response.refreshing) {
         setFailedSearches((current) => ({ ...current, [item.id]: true }));
         setWarnings(response.warnings.length ? response.warnings : [`No verified ${brandName} options are catalogued for this category yet. Retry the background refresh later.`]);
@@ -894,8 +1061,8 @@ export default function App() {
     } catch (caught) {
       setWarnings([caught instanceof Error ? `Catalogue status check paused: ${caught.message}` : "Catalogue status check paused. You can retry it later."]);
     } finally {
-      setRefreshingCatalogs((current) => ({ ...current, [item.id]: false }));
-      catalogPolls.current.delete(item.id);
+      catalogPolls.current.delete(pollKey);
+      setRefreshingCatalogs((current) => ({ ...current, [item.id]: [...catalogPolls.current].some((key) => key.startsWith(`${item.id}:`)) }));
     }
   }
 
@@ -912,23 +1079,128 @@ export default function App() {
   }
 
   function currentDraft(): SavedDraft {
-    return { step, project, items, activeId, priceCurrency, exchangeRateSets, catalogFilters, catalogViews, selectedMatches, searchResults, candidatePrices, candidateCurrencies, lastExportAt };
+    return { step, project, items, activeId, priceCurrency, exchangeRateSets, freightPercent, catalogFilters, catalogViews, selectedMatches, searchResults, comparisonCounts, comparisonBrands, candidatePrices, candidateCurrencies, lastExportAt, teamProjectId, teamProjectRevision };
   }
 
-  function restoreProject(recent: RecentProject) {
-    const draft = normalizeSavedDraft(recent.draft);
-    const nextRecent = recentProjects.filter((candidate) => candidate.id !== recent.id);
-    localStorage.setItem(RECENT_PROJECTS_KEY, JSON.stringify(nextRecent));
-    setRecentProjects(nextRecent);
+  function shareableDraft(): SavedDraft {
+    return {
+      ...currentDraft(),
+      catalogViews: {},
+      selectedMatches: {},
+      searchResults: {},
+      candidatePrices: {},
+      candidateCurrencies: {},
+      teamProjectId: teamProjectIdentity.current.id || undefined,
+      teamProjectRevision: teamProjectIdentity.current.revision,
+    };
+  }
+
+  async function refreshTeamProjects() {
+    setTeamProjectsLoading(true);
+    try {
+      let shared = await listTeamProjects();
+      const migratedRecents = [...recentProjects];
+      let migrated = false;
+      for (let index = 0; index < migratedRecents.length; index += 1) {
+        const recent = migratedRecents[index];
+        if (!recent.draft.project.project_name.trim() || recent.draft.teamProjectId) continue;
+        const existing = shared.find((candidate) =>
+          candidate.project_name.trim().toLowerCase() === recent.projectName.trim().toLowerCase()
+          && candidate.reference.trim().toLowerCase() === recent.reference.trim().toLowerCase());
+        if (existing) {
+          migratedRecents[index] = { ...recent, draft: { ...recent.draft, teamProjectId: existing.id, teamProjectRevision: existing.revision } };
+          migrated = true;
+          continue;
+        }
+        const completion = projectCompletion(recent.draft);
+        const compactDraft = { ...recent.draft, catalogViews: {}, selectedMatches: {}, searchResults: {}, candidatePrices: {}, candidateCurrencies: {} };
+        const saved = await saveTeamProject({
+          project_name: recent.projectName.trim() || recent.draft.project.project_name.trim(),
+          client: recent.client.trim(),
+          consultant: recent.draft.project.consultant.trim(),
+          contractor: recent.draft.project.contractor.trim(),
+          reference: recent.reference.trim(),
+          status: completion.status,
+          progress: completion.progress,
+          missing_fields: completion.missingFields,
+          item_count: recent.draft.items.length,
+          draft: compactDraft as unknown as Record<string, unknown>,
+        });
+        shared = [saved, ...shared];
+        migratedRecents[index] = { ...recent, draft: { ...recent.draft, teamProjectId: saved.id, teamProjectRevision: saved.revision } };
+        migrated = true;
+      }
+      if (migrated) {
+        localStorage.setItem(RECENT_PROJECTS_KEY, JSON.stringify(migratedRecents));
+        setRecentProjects(migratedRecents);
+      }
+      setTeamProjects(shared);
+      setTeamProjectsConfigured(true);
+    } catch (caught) {
+      setTeamProjectsMessage(caught instanceof Error ? caught.message : "Could not load the team projects.");
+    } finally {
+      setTeamProjectsLoading(false);
+    }
+  }
+
+  async function persistTeamDraft(force = false) {
+    if (!teamProjectsConfigured || !project.project_name.trim()) return true;
+    const draft = shareableDraft();
+    const completion = projectCompletion(draft);
+    const payload = {
+      id: teamProjectIdentity.current.id || undefined,
+      expected_revision: teamProjectIdentity.current.revision,
+      project_name: project.project_name.trim(),
+      client: project.client.trim(),
+      consultant: project.consultant.trim(),
+      contractor: project.contractor.trim(),
+      reference: project.reference.trim(),
+      status: completion.status,
+      progress: completion.progress,
+      missing_fields: completion.missingFields,
+      item_count: items.length,
+      draft: draft as unknown as Record<string, unknown>,
+    };
+    const signature = JSON.stringify({ ...payload, id: undefined, expected_revision: undefined });
+    if (!force && signature === lastTeamSignature.current) return true;
+    setTeamSaveState("saving");
+    try {
+      const saved = await saveTeamProject(payload);
+      teamProjectIdentity.current = { id: saved.id, revision: saved.revision };
+      setTeamProjectId(saved.id);
+      setTeamProjectRevision(saved.revision);
+      lastTeamSignature.current = signature;
+      setTeamSaveState("saved");
+      setTeamProjects((current) => [saved, ...current.filter((candidate) => candidate.id !== saved.id)]);
+      return true;
+    } catch (caught) {
+      const message = caught instanceof Error ? caught.message : "The shared project could not be saved.";
+      const conflict = /updated by another team member|revision/i.test(message);
+      setTeamSaveState(conflict ? "conflict" : "idle");
+      setError(message);
+      return false;
+    }
+  }
+
+  function loadDraft(draftValue: SavedDraft, fallbackStep: number, remote?: Pick<TeamProjectRecord, "id" | "revision">) {
+    const draft = normalizeSavedDraft(draftValue);
+    const remoteId = remote?.id || draft.teamProjectId || "";
+    const remoteRevision = remote?.revision || draft.teamProjectRevision;
+    teamProjectIdentity.current = { id: remoteId, revision: remoteRevision };
+    setTeamProjectId(remoteId);
+    setTeamProjectRevision(remoteRevision);
     setProject(draft.project || emptyProject());
     setItems((draft.items || []).map(normalizeItemBrand));
     setActiveId(draft.activeId || draft.items?.[0]?.id || "");
     setPriceCurrency(draft.priceCurrency || "OMR");
     setExchangeRateSets({ ...defaultExchangeRates(), ...(draft.exchangeRateSets || {}) });
+    setFreightPercent(draft.freightPercent ?? 15);
     setCatalogFilters(draft.catalogFilters || {});
     setCatalogViews(draft.catalogViews || {});
     setSelectedMatches(draft.selectedMatches || {});
     setSearchResults(draft.searchResults || {});
+    setComparisonCounts(draft.comparisonCounts || {});
+    setComparisonBrands(draft.comparisonBrands || {});
     setCandidatePrices(draft.candidatePrices || {});
     setCandidateCurrencies(draft.candidateCurrencies || {});
     setLastExportAt(draft.lastExportAt || null);
@@ -937,12 +1209,45 @@ export default function App() {
     setWarnings([]);
     setError("");
     setSuccess("");
-    const fallbackStep = recent.status !== "draft" ? 3 : draft.items.length ? 1 : 0;
     setStep(Math.max(0, Math.min(3, draft.step ?? fallbackStep)));
   }
 
-  function finishProjectAndStartNew() {
+  function restoreProject(recent: RecentProject) {
+    const fallbackStep = recent.status !== "draft" ? 3 : recent.draft.items.length ? 1 : 0;
+    loadDraft(recent.draft, fallbackStep);
+  }
+
+  async function restoreTeamProject(summary: TeamProjectSummary) {
+    setTeamProjectsLoading(true);
+    loadingTeamProject.current = true;
+    try {
+      const saved = await getTeamProject(summary.id);
+      const draft = normalizeSavedDraft(saved.draft as Partial<SavedDraft>);
+      lastTeamSignature.current = JSON.stringify({
+        project_name: saved.project_name,
+        client: saved.client,
+        consultant: saved.consultant,
+        contractor: saved.contractor,
+        reference: saved.reference,
+        status: saved.status,
+        progress: saved.progress,
+        missing_fields: saved.missing_fields,
+        item_count: saved.item_count,
+        draft: { ...draft, teamProjectId: saved.id, teamProjectRevision: saved.revision },
+      });
+      loadDraft(draft, saved.status === "complete" ? 3 : draft.items.length ? 1 : 0, saved);
+      setSuccess(`Opened shared project: ${recentProjectTitle({ id: saved.id, projectName: saved.project_name, client: saved.client, reference: saved.reference, completedAt: saved.updated_at, draft })}`);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not open the shared project.");
+    } finally {
+      window.setTimeout(() => { loadingTeamProject.current = false; }, 250);
+      setTeamProjectsLoading(false);
+    }
+  }
+
+  async function finishProjectAndStartNew() {
     if (!lastExportAt || !project.project_name.trim()) return;
+    if (!await persistTeamDraft(true)) return;
     const completedAt = new Date().toISOString();
     const archive: RecentProject = {
       id: crypto.randomUUID(),
@@ -970,6 +1275,8 @@ export default function App() {
     setCatalogFilters({});
     setCatalogViews({});
     setSearchResults({});
+    setComparisonCounts({});
+    setComparisonBrands({});
     setSelectedMatches({});
     setCandidatePrices({});
     setCandidateCurrencies({});
@@ -977,11 +1284,18 @@ export default function App() {
     setRefreshingCatalogs({});
     setFailedSearches({});
     setExchangeRateSets(defaultExchangeRates());
+    setFreightPercent(15);
     setPriceCurrency("OMR");
     setLastExportAt(null);
+    teamProjectIdentity.current = { id: "" };
+    setTeamProjectId("");
+    setTeamProjectRevision(undefined);
+    setTeamSaveState("idle");
+    lastTeamSignature.current = "";
     setWarnings([]);
     setError("");
-    setSuccess("Previous project archived. A new blank project is ready.");
+    void refreshTeamProjects();
+    setSuccess("Project saved to the team workspace. A new blank project is ready.");
   }
 
   async function selectExportFolder() {
@@ -1025,7 +1339,7 @@ export default function App() {
     setError("");
     setSuccess("");
     try {
-      const result = await downloadCommercial(project, selectedItems, priceCurrency, exchangeRateSets[priceCurrency], projectExportName(project, "Commercial Quotation"));
+      const result = await downloadCommercial(project, selectedItems, priceCurrency, exchangeRateSets[priceCurrency], freightPercent, projectExportName(project, "Commercial Quotation"));
       setLastExportAt(new Date().toISOString());
       setSuccess(`Saved ${result.filename} to ${result.path}`);
     } catch (caught) {
@@ -1056,7 +1370,7 @@ export default function App() {
             </button>
           ))}
         </nav>
-        <div className="autosave"><Save size={16} /><div><strong>Draft autosaved</strong><small>Stored privately on this computer</small></div></div>
+        <div className="autosave"><Save size={16} /><div><strong>{teamSaveState === "saving" ? "Saving to team…" : teamSaveState === "conflict" ? "Team save needs review" : teamProjectsConfigured ? "Team draft autosaved" : "Draft autosaved"}</strong><small>{teamProjectsConfigured ? "Shared securely through Supabase" : "Stored privately on this computer"}</small></div></div>
       </aside>
 
       <main className="main-panel">
@@ -1064,7 +1378,47 @@ export default function App() {
           <div><span className="eyebrow">TECS LIGHTING</span><h1>{STEPS[step]}</h1></div>
           <div className="top-statuses"><div className="zoom-controls" aria-label="Interface zoom"><button disabled={uiZoom <= 80} onClick={() => setUiZoom((value) => Math.max(80, value - 10))} title="Make interface smaller"><Minus size={13} /></button><button className="zoom-value" onClick={() => setUiZoom(100)} title="Reset interface size">{uiZoom}%</button><button disabled={uiZoom >= 150} onClick={() => setUiZoom((value) => Math.min(150, value + 10))} title="Make interface larger"><Plus size={13} /></button></div><div className={`engine-chip ${localAI?.available ? "ready" : ""}`}><ShieldCheck size={14} />{localAI?.available ? "Drawing AI ready" : "Manual mode ready"}</div><button className={`engine-chip api-settings-trigger ${apiReady ? "ready" : ""} ${serviceStatus === "offline" ? "offline" : ""}`} onClick={() => { setApiSettingsMessage(serviceStatus === "offline" ? "The local TECS service is not running. Restart the application, then try again." : ""); setApiSettingsOpen(true); }}><Settings size={14} />{serviceStatus === "checking" ? "Connecting to local service…" : serviceStatus === "offline" ? "Local service offline" : apiReady ? "API settings" : "Set up product API"}</button></div>
         </header>
-        {apiSettingsOpen && <div className="settings-overlay" onMouseDown={(event) => event.target === event.currentTarget && setApiSettingsOpen(false)}><section className="settings-panel settings-panel-wide" role="dialog" aria-modal="true" aria-labelledby="api-settings-title"><div className="settings-header"><div className="settings-icon">{settingsTab === "api" ? <KeyRound size={20} /> : <Users size={20} />}</div><div><span className="section-kicker">SETTINGS</span><h2 id="api-settings-title">{settingsTab === "api" ? "OpenAI API" : "Shared catalogue"}</h2></div><button className="settings-close" onClick={() => setApiSettingsOpen(false)} aria-label="Close settings">×</button></div><div className="settings-tabs"><button className={settingsTab === "api" ? "active" : ""} onClick={() => setSettingsTab("api")}><KeyRound size={14} />Product API</button><button className={settingsTab === "team" ? "active" : ""} onClick={() => setSettingsTab("team")}><Users size={14} />Shared catalogue</button></div>{settingsTab === "api" ? <><p className="settings-description">The key is stored securely on this computer and is used only for official manufacturer product searches.</p><div className={`api-key-status ${serviceStatus === "offline" ? "offline" : apiReady ? "configured" : "missing"}`}><span></span><strong>{serviceStatus === "checking" ? "Connecting to the local TECS service…" : serviceStatus === "offline" ? "Local TECS service is offline" : apiReady ? "API key configured" : "No API key configured"}</strong></div><label><span>{apiReady ? "Enter a replacement key" : "OpenAI API key"}</span><input type="password" autoComplete="off" disabled={serviceStatus !== "ready"} value={apiKey} onChange={(event) => { setApiKey(event.target.value); setApiSettingsMessage(""); }} /></label>{apiSettingsMessage && <div className={`settings-message ${serviceStatus === "offline" ? "error" : ""}`}>{apiSettingsMessage}</div>}<div className="settings-actions">{apiReady && <button className="remove-key" disabled={busy || serviceStatus !== "ready"} onClick={clearApiKey}><Trash2 size={15} />Remove key</button>}<button className="primary" disabled={!apiKey.trim() || busy || serviceStatus !== "ready"} onClick={configureApiKey}>{busy ? <LoaderCircle className="spin" size={15} /> : <Save size={15} />}{apiReady ? "Save replacement" : "Save API key"}</button></div></> : <><p className="settings-description">The shared product catalogue works automatically. No account, email, password, or setup is required.</p><div className="api-key-status configured"><span></span><strong>{teamCatalog?.syncing ? "Syncing shared products…" : `Ready · ${teamCatalog?.shared_products || 0} shared products`}</strong></div><div className="team-privacy-note"><ShieldCheck size={16} /><span>Only reusable manufacturer product details are shared. Projects, customer files, prices, and OpenAI keys stay local.</span></div>{teamMessage && <div className={`settings-message ${/failed|could not|invalid|error/i.test(teamMessage) ? "error" : ""}`}>{teamMessage}</div>}{teamCatalog?.last_error && <div className="settings-message error">Last automatic sync: {teamCatalog.last_error}</div>}<div className="settings-actions"><button className="primary" disabled={busy || teamCatalog?.syncing} onClick={syncSharedCatalog}>{busy || teamCatalog?.syncing ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}Sync now</button></div></>}</section></div>}
+        {apiSettingsOpen && <div className="settings-overlay" onMouseDown={(event) => event.target === event.currentTarget && setApiSettingsOpen(false)}>
+          <section className="settings-panel settings-panel-wide" role="dialog" aria-modal="true" aria-labelledby="api-settings-title">
+            <div className="settings-header">
+              <div className="settings-icon">{settingsTab === "api" ? <KeyRound size={20} /> : settingsTab === "team" ? <Users size={20} /> : <FolderKanban size={20} />}</div>
+              <div><span className="section-kicker">SETTINGS</span><h2 id="api-settings-title">{settingsTab === "api" ? "OpenAI API" : settingsTab === "team" ? "Shared catalogue" : "Team projects"}</h2></div>
+              <button className="settings-close" onClick={() => setApiSettingsOpen(false)} aria-label="Close settings">×</button>
+            </div>
+            <div className="settings-tabs">
+              <button className={settingsTab === "api" ? "active" : ""} onClick={() => setSettingsTab("api")}><KeyRound size={14} />Product API</button>
+              <button className={settingsTab === "team" ? "active" : ""} onClick={() => setSettingsTab("team")}><Users size={14} />Catalogue</button>
+              <button className={settingsTab === "projects" ? "active" : ""} onClick={() => setSettingsTab("projects")}><FolderKanban size={14} />Projects</button>
+            </div>
+            {settingsTab === "api" ? <>
+              <p className="settings-description">The key is stored securely on this computer and is used only for official manufacturer product searches.</p>
+              <div className={`api-key-status ${serviceStatus === "offline" ? "offline" : apiReady ? "configured" : "missing"}`}><span></span><strong>{serviceStatus === "checking" ? "Connecting to the local TECS service…" : serviceStatus === "offline" ? "Local TECS service is offline" : apiReady ? "API key configured" : "No API key configured"}</strong></div>
+              <label><span>{apiReady ? "Enter a replacement key" : "OpenAI API key"}</span><input type="password" autoComplete="off" disabled={serviceStatus !== "ready"} value={apiKey} onChange={(event) => { setApiKey(event.target.value); setApiSettingsMessage(""); }} /></label>
+              {apiSettingsMessage && <div className={`settings-message ${serviceStatus === "offline" ? "error" : ""}`}>{apiSettingsMessage}</div>}
+              <div className="settings-actions">{apiReady && <button className="remove-key" disabled={busy || serviceStatus !== "ready"} onClick={clearApiKey}><Trash2 size={15} />Remove key</button>}<button className="primary" disabled={!apiKey.trim() || busy || serviceStatus !== "ready"} onClick={configureApiKey}>{busy ? <LoaderCircle className="spin" size={15} /> : <Save size={15} />}{apiReady ? "Save replacement" : "Save API key"}</button></div>
+            </> : settingsTab === "team" ? <>
+              <p className="settings-description">The shared product catalogue works automatically. No account, email, password, or setup is required.</p>
+              <div className="api-key-status configured"><span></span><strong>{teamCatalog?.syncing ? "Syncing shared products…" : `Ready · ${teamCatalog?.shared_products || 0} shared products`}</strong></div>
+              <div className="team-privacy-note"><ShieldCheck size={16} /><span>Only reusable manufacturer product details are shared. Customer project records use a separate protected workspace.</span></div>
+              {teamMessage && <div className={`settings-message ${/failed|could not|invalid|error/i.test(teamMessage) ? "error" : ""}`}>{teamMessage}</div>}
+              {teamCatalog?.last_error && <div className="settings-message error">Last automatic sync: {teamCatalog.last_error}</div>}
+              <div className="settings-actions"><button className="primary" disabled={busy || teamCatalog?.syncing} onClick={syncSharedCatalog}>{busy || teamCatalog?.syncing ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}Sync now</button></div>
+            </> : <>
+              <p className="settings-description">Enter the private TECS workspace code once. It is stored in this computer’s secure credential manager and lets the team reopen the same Pending and Complete projects.</p>
+              <div className={`api-key-status ${teamProjectsConfigured ? "configured" : "missing"}`}><span></span><strong>{teamProjectsConfigured ? `${teamProjects.length} shared project${teamProjects.length === 1 ? "" : "s"} available` : "Team workspace not connected"}</strong></div>
+              <div className="team-privacy-note"><ShieldCheck size={16} /><span>Supabase blocks direct public access to customer projects. Both a valid Supabase request and this private workspace code are required.</span></div>
+              {(!teamProjectsConfigured || showTeamCodeEditor) && <label><span>{teamProjectsConfigured ? "New workspace code" : "Team workspace code"}</span><input type="password" autoComplete="off" disabled={serviceStatus !== "ready"} value={teamWorkspaceKey} onChange={(event) => { setTeamWorkspaceKey(event.target.value); setTeamProjectsMessage(""); }} /></label>}
+              {teamProjectsMessage && <div className={`settings-message ${/failed|could not|invalid|error|incomplete/i.test(teamProjectsMessage) ? "error" : ""}`}>{teamProjectsMessage}</div>}
+              <div className="settings-actions">
+                {teamProjectsConfigured && <button className="remove-key" disabled={busy} onClick={clearTeamProjectsKey}><Trash2 size={15} />Disconnect</button>}
+                {teamProjectsConfigured && !showTeamCodeEditor ? <button className="secondary" disabled={busy} onClick={() => { setTeamProjectsMessage(""); setShowTeamCodeEditor(true); }}>Change code</button> : <>
+                  {teamProjectsConfigured && <button className="secondary" disabled={busy} onClick={() => { setTeamWorkspaceKey(""); setShowTeamCodeEditor(false); }}>Cancel</button>}
+                  <button className="primary" disabled={!teamWorkspaceKey.trim() || busy || serviceStatus !== "ready"} onClick={configureTeamProjects}>{busy ? <LoaderCircle className="spin" size={15} /> : <Save size={15} />}{teamProjectsConfigured ? "Save new code" : "Connect workspace"}</button>
+                </>}
+              </div>
+            </>}
+          </section>
+        </div>}
         {error && <div className="error-banner">{error}<button onClick={() => setError("")}>Dismiss</button></div>}
         {success && <div className="success-banner">{success}<button onClick={() => setSuccess("")}>Dismiss</button></div>}
 
@@ -1091,7 +1445,24 @@ export default function App() {
                 <button className="secondary" disabled={!files.length || busy} onClick={processDrawings}>{busy ? <LoaderCircle className="spin" size={17} /> : <ArrowRight size={17} />}Extract first draft</button>
               </div>
             </div>
-            {recentProjects.length > 0 && <div className="recent-projects"><div className="recent-projects-heading"><div><span className="section-kicker">RECENT PROJECTS</span><h3>Reopen previous work</h3></div><small>Stored privately on this computer</small></div><div className="recent-project-list">{recentProjects.map((recent) => <article key={recent.id}><div><strong>{recentProjectTitle(recent)}</strong><span>{[recent.client ? `Client: ${recent.client}` : "", recent.reference ? `Reference: ${recent.reference}` : ""].filter(Boolean).join(" · ") || "No client or reference"}</span><small>{recent.draft.items.length} product{recent.draft.items.length === 1 ? "" : "s"} · {recent.status === "draft" ? "Saved" : "Completed"} {new Date(recent.completedAt).toLocaleString()}</small></div><button className="secondary" onClick={() => restoreProject(recent)}>Reopen</button></article>)}</div></div>}
+            <div className="recent-projects team-projects">
+              <div className="recent-projects-heading"><div><span className="section-kicker">TEAM PROJECTS</span><h3>Open work from any team computer</h3></div>{teamProjectsConfigured ? <button className="secondary compact" disabled={teamProjectsLoading} onClick={refreshTeamProjects}>{teamProjectsLoading ? <LoaderCircle className="spin" size={13} /> : <RefreshCw size={13} />}Refresh</button> : <button className="secondary compact" onClick={() => { setSettingsTab("projects"); setApiSettingsOpen(true); }}><Settings size={13} />Connect</button>}</div>
+              {teamProjectsConfigured ? <>
+                <div className="project-status-tabs">
+                  <button className={teamProjectsTab === "pending" ? "active" : ""} onClick={() => setTeamProjectsTab("pending")}>Pending <span>{teamProjects.filter((candidate) => candidate.status === "pending").length}</span></button>
+                  <button className={teamProjectsTab === "complete" ? "active" : ""} onClick={() => setTeamProjectsTab("complete")}>Complete <span>{teamProjects.filter((candidate) => candidate.status === "complete").length}</span></button>
+                </div>
+                {teamProjectsMessage && /failed|could not|invalid|error|incomplete/i.test(teamProjectsMessage) && <div className="settings-message error">{teamProjectsMessage}</div>}
+                <div className="recent-project-list">
+                  {teamProjects.filter((candidate) => candidate.status === teamProjectsTab).map((saved) => <article key={saved.id}>
+                    <div><strong>{[saved.reference, saved.project_name].filter(Boolean).join(" — ") || "Untitled project"}</strong><span>{[saved.client ? `Client: ${saved.client}` : "", saved.consultant ? `Consultant: ${saved.consultant}` : ""].filter(Boolean).join(" · ") || "Project details pending"}</span><small>{saved.item_count} product{saved.item_count === 1 ? "" : "s"} · {saved.progress}% complete · Updated {new Date(saved.updated_at).toLocaleString()}</small>{saved.status === "pending" && saved.missing_fields.length > 0 && <small className="missing-summary">Needs: {saved.missing_fields.slice(0, 3).join(", ")}{saved.missing_fields.length > 3 ? ` +${saved.missing_fields.length - 3} more` : ""}</small>}</div>
+                    <button className="secondary" disabled={teamProjectsLoading} onClick={() => restoreTeamProject(saved)}>Open</button>
+                  </article>)}
+                  {!teamProjectsLoading && !teamProjects.some((candidate) => candidate.status === teamProjectsTab) && <div className="empty-projects">No {teamProjectsTab} team projects yet.</div>}
+                </div>
+              </> : <div className="empty-projects">Connect the private team workspace code in Settings to view and share every project.</div>}
+            </div>
+            {recentProjects.length > 0 && <div className="recent-projects local-recovery"><div className="recent-projects-heading"><div><span className="section-kicker">LOCAL RECOVERY</span><h3>Drafts recovered from this computer</h3></div><small>Not shared</small></div><div className="recent-project-list">{recentProjects.map((recent) => <article key={recent.id}><div><strong>{recentProjectTitle(recent)}</strong><span>{[recent.client ? `Client: ${recent.client}` : "", recent.reference ? `Reference: ${recent.reference}` : ""].filter(Boolean).join(" · ") || "No client or reference"}</span><small>{recent.draft.items.length} product{recent.draft.items.length === 1 ? "" : "s"} · Recovered {new Date(recent.completedAt).toLocaleString()}</small></div><button className="secondary" onClick={() => restoreProject(recent)}>Open recovery</button></article>)}</div></div>}
           </section>
         )}
 
@@ -1149,12 +1520,17 @@ export default function App() {
               </div>
               {activeItem && <div className="editor-card product-editor">
                 <div className="ai-search-panel">
-                  <div className="search-panel-copy"><div className="ai-icon"><Search size={18} /></div><div><strong>Official {activeItem.brand} product research</strong><span>Use this only when the saved catalogue does not contain the product you need or its information is outdated.</span></div></div>
-                  <div className="search-controls"><label className="tolerance-field"><span>Lumens ±</span><input type="number" min="0" max="100" value={searchTolerance.lumens_percent} onChange={(event) => setSearchTolerance((current) => ({ ...current, lumens_percent: Number(event.target.value) }))} /><small>%</small></label><label className="tolerance-field"><span>Watts ±</span><input type="number" min="0" max="100" value={searchTolerance.wattage_percent} onChange={(event) => setSearchTolerance((current) => ({ ...current, wattage_percent: Number(event.target.value) }))} /><small>%</small></label>{!apiReady ? <button className="outline api-settings-shortcut" onClick={() => setApiSettingsOpen(true)}><Settings size={15} />Configure API</button> : <button className="primary" disabled={!catalogApiReady || searching === activeItem.id || refreshingCatalogs[activeItem.id]} onClick={() => findBestProducts(activeItem)}>{searching === activeItem.id || refreshingCatalogs[activeItem.id] ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}{refreshingCatalogs[activeItem.id] ? "Researching official sources…" : activeCatalog?.products.some((product) => product.freshness === "outdated") ? "Refresh outdated products" : "Search official catalogue"}</button>}</div>
+                  <div className="search-panel-copy"><div className="ai-icon"><Search size={18} /></div><div><strong>Official multi-brand product research</strong><span>Compare saved and official manufacturer options against the same requirement.</span></div></div>
+                  <div className="search-controls"><label className="tolerance-field"><span>Lumens ±</span><input type="number" min="0" max="100" value={searchTolerance.lumens_percent} onChange={(event) => setSearchTolerance((current) => ({ ...current, lumens_percent: Number(event.target.value) }))} /><small>%</small></label><label className="tolerance-field"><span>Watts ±</span><input type="number" min="0" max="100" value={searchTolerance.wattage_percent} onChange={(event) => setSearchTolerance((current) => ({ ...current, wattage_percent: Number(event.target.value) }))} /><small>%</small></label>{!apiReady ? <button className="outline api-settings-shortcut" onClick={() => setApiSettingsOpen(true)}><Settings size={15} />Configure API</button> : <button className="primary" disabled={!catalogApiReady || !comparisonReady || searching === activeItem.id || refreshingCatalogs[activeItem.id]} onClick={() => findBestProducts(activeItem)}>{searching === activeItem.id || refreshingCatalogs[activeItem.id] ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}{refreshingCatalogs[activeItem.id] ? "Researching selected brands…" : `Compare ${activeComparisonCount} brand${activeComparisonCount === 1 ? "" : "s"}`}</button>}</div>
+                </div>
+                <div className="brand-comparison-panel">
+                  <div className="comparison-count-control"><label><span>Number of brands</span><select value={activeComparisonCount} onChange={(event) => updateComparisonCount(activeItem, Number(event.target.value))}>{[1, 2, 3, 4, 5].map((count) => <option key={count} value={count}>{count}</option>)}</select></label><button type="button" disabled={activeComparisonCount >= 5} onClick={() => updateComparisonCount(activeItem, activeComparisonCount + 1)}><Plus size={14} />Add brand</button></div>
+                  <div className="comparison-brand-selects">{Array.from({ length: activeComparisonCount }, (_, index) => <div className="comparison-brand-field" key={index}><label><span>Comparison brand {index + 1}</span><select value={activeComparisonBrands[index] || ""} onChange={(event) => updateComparisonBrand(activeItem, index, event.target.value)}><option value="">Choose brand</option>{BRANDS.map((brand) => <option key={brand.name} value={brand.name} disabled={activeComparisonBrands.some((selected, selectedIndex) => selectedIndex !== index && canonicalBrand(selected) === brand.name)}>{brand.name}</option>)}</select></label>{activeComparisonCount > 1 && <button type="button" title={`Remove comparison brand ${index + 1}`} onClick={() => removeComparisonBrand(activeItem, index)}><X size={13} /></button>}</div>)}</div>
+                  <small>{activeComparisonCount === 1 ? "5 options from this brand" : activeComparisonCount === 2 ? "3 options from each brand" : "2 options from each brand"}</small>
                 </div>
                 {searchInfo[activeItem.id]?.last_verified_at && <div className="catalog-evidence"><ShieldCheck size={13} /><span>Catalogue verified {new Date(searchInfo[activeItem.id].last_verified_at!).toLocaleDateString()}{searchInfo[activeItem.id].stale ? " · refresh in progress" : ""}</span>{searchInfo[activeItem.id].usage && <small>{searchInfo[activeItem.id].usage!.total_tokens.toLocaleString()} API tokens used for that catalogue refresh</small>}</div>}
                 <div className="product-identity">
-                  <label><span>Brand</span><select value={activeItem.brand} disabled={browsingCatalog === activeItem.id} onChange={(event) => { updateIdentity(activeItem.id, "brand", event.target.value); setItemCatalogView(activeItem.id, "saved"); }}>{BRANDS.map((brand) => <option key={brand.name}>{brand.name}</option>)}</select></label>
+                  <label><span>Finalized product brand</span><input className="search-output" value={activeItem.brand} readOnly /></label>
                   <label><span>Product / family</span><input className="search-output" value={activeItem.product_name} readOnly /></label>
                   <label><span>Model number</span><input className="search-output" value={activeItem.model_no} readOnly /></label>
                   <label><span>Country of origin</span><input className="search-output" value={activeItem.country_of_origin} readOnly /></label>
@@ -1181,7 +1557,7 @@ export default function App() {
                 {catalogView === "saved" && catalogFilterActive && filteredCatalogProducts.length === 0 && <div className="catalog-filter-prompt"><span><strong>No saved products match these filters.</strong> Close the catalogue and use the official API search above.</span></div>}
                 {failedSearches[activeItem.id] && activeItem.product_name && <div className="stale-product-notice"><ShieldCheck size={14} /><span><strong>Previous finalized product retained.</strong> The latest search did not return a verified shortlist, so the product details below were not replaced.</span></div>}
                 {catalogView !== "closed" && filteredCatalogProducts.length > 0 && <div className="api-results">
-                  <div className="results-heading"><strong>{catalogView === "api" ? "Official API search results" : `Saved products matching your filters (${filteredCatalogProducts.length})`}</strong><span>{catalogView === "api" ? "Review the verified results and select the product to use." : "Review the filtered options and select the product to use."}</span></div>
+                  <div className="results-heading"><strong>{catalogView === "api" ? `Official comparison · ${filteredCatalogProducts.length} options across ${activeComparisonCount} brand${activeComparisonCount === 1 ? "" : "s"}` : `Saved products matching your filters (${filteredCatalogProducts.length})`}</strong><span>{catalogView === "api" ? "Each option is freshly ranked against this fitting's requirements." : "Review the filtered options and select the product to use."}</span></div>
                   <div className="result-grid">{filteredCatalogProducts.map((product, index) => {
                     const priceKey = `${activeItem.id}:${product.id}`;
                     const isSelectedProduct = selectedMatches[activeItem.id] === product.id;
@@ -1190,8 +1566,9 @@ export default function App() {
                     const unitPrice = Number(priceValue);
                     const hasMismatch = product.criteria.some((criterion) => criterion.status === "mismatch");
                     const hasUnknown = product.criteria.some((criterion) => criterion.status === "unknown");
+                    const brandRank = filteredCatalogProducts.slice(0, index).filter((candidate) => canonicalBrand(candidate.brand) === canonicalBrand(product.brand)).length + 1;
                     return <article className={`api-product ${catalogView === "saved" ? "manual-catalog-product" : ""} ${selectedMatches[activeItem.id] === product.id ? "selected" : ""}`} key={product.id}>
-                      <div className="result-rank">{catalogView === "api" ? `#${index + 1}` : <Search size={12} />}</div><div className="result-main"><strong>{product.product_name}</strong><span>{product.product_code || "Order code not published"} · {product.catalog_family || "Other products"}{catalogView === "api" ? ` · ${matchSummary(product)}` : ""}</span><div className="verification-row"><span className={`freshness-badge ${product.freshness || "current"}`}>{product.freshness === "outdated" ? "Outdated" : product.freshness === "incomplete" ? "Missing details" : "Current"}</span><span className={`verification-badge ${product.verification_level || "product_page"}`}><ShieldCheck size={11} />{verificationLabel(product)}</span>{product.verified_at && <small>Verified {new Date(product.verified_at).toLocaleDateString()}</small>}<small className={`manufacturer-date ${product.manufacturer_updated_at ? "published" : "unknown"}`}>Manufacturer updated: {displayManufacturerDate(product.manufacturer_updated_at)}</small></div><div className="product-facts">{productFacts(product).map((fact) => <small key={fact}>{fact}</small>)}</div><div className="result-links"><button onClick={() => openOfficialLink(product.product_url)}>Official product <ExternalLink size={11} /></button>{product.datasheet_url && <button onClick={() => openOfficialLink(product.datasheet_url!)}>Datasheet <ExternalLink size={11} /></button>}</div></div>{catalogView === "api" && <div className={`result-score ${product.score >= 80 ? "high" : ""}`}>{product.score}%<small>match</small></div>}<button className={selectedMatches[activeItem.id] === product.id ? "selected-product" : "select-product"} onClick={() => finalizeProduct(activeItem, product)}>{selectedMatches[activeItem.id] === product.id ? <><Check size={14} />Finalized</> : "Use product"}</button>
+                      <div className="result-rank">{catalogView === "api" ? `#${brandRank}` : <Search size={12} />}</div><div className="result-main"><strong>{product.product_name}</strong><span>{catalogView === "api" ? `${canonicalBrand(product.brand)} · ` : ""}{product.model_number || product.product_code || "Model not published"}{product.model_number && product.product_code ? ` · Order code ${product.product_code}` : ""} · {product.catalog_family || "Other products"}{catalogView === "api" ? ` · ${matchSummary(product)}` : ""}</span><div className="verification-row"><span className={`freshness-badge ${product.freshness || "current"}`}>{product.freshness === "outdated" ? "Outdated" : product.freshness === "incomplete" ? "Missing details" : "Current"}</span><span className={`verification-badge ${product.verification_level || "product_page"}`}><ShieldCheck size={11} />{verificationLabel(product)}</span>{product.verified_at && <small>Verified {new Date(product.verified_at).toLocaleDateString()}</small>}<small className={`manufacturer-date ${product.manufacturer_updated_at ? "published" : "unknown"}`}>Manufacturer updated: {displayManufacturerDate(product.manufacturer_updated_at)}</small></div><div className="product-facts">{productFacts(product).map((fact) => <small key={fact}>{fact}</small>)}</div><div className="result-links"><button onClick={() => openOfficialLink(product.product_url)}>Official product <ExternalLink size={11} /></button>{product.datasheet_url && <button onClick={() => openOfficialLink(product.datasheet_url!)}>Datasheet <ExternalLink size={11} /></button>}</div></div>{catalogView === "api" && <div className={`result-score ${product.score >= 80 ? "high" : ""}`}>{product.score}%<small>match</small></div>}<button className={selectedMatches[activeItem.id] === product.id ? "selected-product" : "select-product"} onClick={() => finalizeProduct(activeItem, product)}>{selectedMatches[activeItem.id] === product.id ? <><Check size={14} />Finalized</> : "Use product"}</button>
                       <div className="commercial-row"><span className={`tolerance-badge ${hasMismatch ? "outside" : hasUnknown ? "verify" : "inside"}`}>{hasMismatch ? "Outside one or more limits" : hasUnknown ? "Within known limits · verify gaps" : "Within selected tolerance"}</span><label><span>Supplier unit price</span><select className="currency-select" value={unitCurrency} onChange={(event) => { const currency = event.target.value as Currency; setCandidateCurrencies((current) => ({ ...current, [priceKey]: currency })); if (isSelectedProduct) updateItem(activeItem.id, (current) => ({ ...current, unit_price_currency: currency })); }}>{CURRENCIES.map((currency) => <option key={currency}>{currency}</option>)}</select><input type="number" min="0" step="0.001" value={priceValue} onChange={(event) => { const value = event.target.value; setCandidatePrices((current) => ({ ...current, [priceKey]: value })); if (isSelectedProduct) updateItem(activeItem.id, (current) => ({ ...current, unit_price: value === "" ? null : Number(value), unit_price_currency: value === "" ? null : unitCurrency })); }} placeholder="Optional" /></label>{unitPrice > 0 && activeItem.quantity > 0 && <strong>Supplier total: {unitCurrency} {(unitPrice * activeItem.quantity).toLocaleString(undefined, { maximumFractionDigits: 3 })}</strong>}</div>
                       <details className="criteria-details"><summary>View requirement comparison ({product.criteria.length})</summary><div className="criteria-grid"><strong>Category</strong><strong>Required</strong><strong>Offered</strong><strong>Result</strong>{product.criteria.map((criterion) => <div className="criterion-row" key={criterion.criterion}><span>{criterion.criterion}</span><span>{criterion.required}</span><span>{criterion.offered}</span><span className={`criterion-status ${criterion.status}`}>{criterion.status}</span></div>)}</div></details>
                     </article>;
@@ -1225,6 +1602,7 @@ export default function App() {
               })}
             </div>
             <div className="exchange-rate-panel"><div className="exchange-rate-copy"><strong>Offer currency and exchange rates</strong><span>Enter how much one unit of each supplier currency equals in the selected offer currency.</span></div><label className="offer-currency"><span>Offer currency</span><select className="currency-select" value={priceCurrency} onChange={(event) => setPriceCurrency(event.target.value as Currency)}>{CURRENCIES.map((currency) => <option key={currency}>{currency}</option>)}</select></label><div className="exchange-rate-grid">{CURRENCIES.map((currency) => <label key={currency} className={currency === priceCurrency ? "base-rate" : ""}><span>1 {currency} =</span><input type="number" min="0" step="0.000001" disabled={currency === priceCurrency} value={currency === priceCurrency ? 1 : exchangeRateSets[priceCurrency][currency] ?? ""} onChange={(event) => { const value = event.target.value; setExchangeRateSets((current) => ({ ...current, [priceCurrency]: { ...current[priceCurrency], [currency]: value === "" ? undefined : Number(value) } })); }} placeholder="Rate" /><small>{priceCurrency}</small></label>)}</div></div>
+            <div className="freight-rate-panel"><div><strong>Commercial freight percentage</strong><span>Applied to every priced item in the commercial workbook’s Freight and Freight Charges columns.</span></div><label><span>Freight</span><div><input type="number" min="0" max="1000" step="0.1" value={freightPercent} onChange={(event) => setFreightPercent(Math.max(0, Number(event.target.value)))} /><small>%</small></div></label><strong>{(1 + freightPercent / 100).toFixed(3)}× Excel multiplier</strong></div>
             <div className="export-destination"><div><FolderOpen size={17} /><span><strong>Export folder</strong><small title={exportFolder}>{exportFolder || "Downloads"}</small></span></div><button className="secondary" disabled={busy || serviceStatus !== "ready"} onClick={selectExportFolder}>Choose folder</button></div>
             <div className="export-panel"><div><Download size={22} /><span><strong>Export selected package</strong><small>{selectedItems.length} product{selectedItems.length === 1 ? "" : "s"} selected · filenames use project, client, and reference</small></span></div><button className="secondary" disabled={!selectedItems.length || busy} onClick={exportCommercialQuotation}>{busy ? <LoaderCircle className="spin" size={17} /> : <FileSpreadsheet size={17} />}Commercial Excel</button><button className="secondary" disabled={!selectedItems.length || busy} onClick={() => exportSheets("xlsx")}>{busy ? <LoaderCircle className="spin" size={17} /> : <FileSpreadsheet size={17} />}Technical Excel</button><button className="primary" disabled={!selectedItems.length || busy} onClick={() => exportSheets("pdf")}>{busy ? <LoaderCircle className="spin" size={17} /> : <FileText size={17} />}Technical PDF</button></div>
             {lastExportAt && <div className="finish-project-panel"><div><CheckCircle2 size={20} /><span><strong>Exports completed?</strong><small>Archive this project and clear the workspace when you are ready to begin another.</small></span></div><button className="primary" disabled={busy} onClick={finishProjectAndStartNew}>Finish project and start new <ArrowRight size={16} /></button></div>}

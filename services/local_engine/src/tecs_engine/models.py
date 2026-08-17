@@ -78,6 +78,7 @@ class ProductSearchRequest(BaseModel):
     brand: str
     domain: str | None = None
     tolerances: Tolerances = Field(default_factory=Tolerances)
+    max_results: int = Field(default=5, ge=1, le=5)
 
 
 class CriterionResult(BaseModel):
@@ -126,6 +127,7 @@ class ProductMatch(BaseModel):
     brand: str
     product_name: str
     product_code: str | None = None
+    model_number: str | None = None
     product_url: HttpUrl
     datasheet_url: HttpUrl | None = None
     image_url: HttpUrl | None = None
@@ -173,6 +175,25 @@ class ApiKeyRequest(BaseModel):
     api_key: str = Field(min_length=20)
 
 
+class TeamWorkspaceKeyRequest(BaseModel):
+    workspace_key: str = Field(min_length=48, max_length=256)
+
+
+class TeamProjectSaveRequest(BaseModel):
+    id: str | None = None
+    expected_revision: int | None = Field(default=None, ge=1)
+    project_name: str = Field(min_length=1, max_length=500)
+    client: str = Field(default="", max_length=500)
+    consultant: str = Field(default="", max_length=500)
+    contractor: str = Field(default="", max_length=500)
+    reference: str = Field(default="", max_length=250)
+    status: Literal["pending", "complete"] = "pending"
+    progress: int = Field(default=0, ge=0, le=100)
+    missing_fields: list[str] = Field(default_factory=list, max_length=100)
+    item_count: int = Field(default=0, ge=0)
+    draft: dict
+
+
 class ProjectDetails(BaseModel):
     project_name: str
     client: str | None = None
@@ -217,3 +238,4 @@ class CommercialQuotationRequest(BaseModel):
     exchange_rates: dict[Literal["OMR", "AED", "USD", "GBP", "EUR"], float] = Field(
         default_factory=dict
     )
+    freight_percent: float = Field(default=15, ge=0, le=1000)

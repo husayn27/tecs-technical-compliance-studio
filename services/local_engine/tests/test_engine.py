@@ -3,17 +3,17 @@ from __future__ import annotations
 from io import BytesIO
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 from openpyxl import load_workbook
 from pypdf import PdfReader
 from reportlab.pdfgen import canvas
-import pytest
 
-from tecs_engine.extractor import WATT_RE, extract_pdf
 from tecs_engine import main as engine_main
-from tecs_engine.main import app
-from tecs_engine.compliance import build_compliance_pdf, build_compliance_xlsx
 from tecs_engine.commercial import build_commercial_xlsx
+from tecs_engine.compliance import build_compliance_pdf, build_compliance_xlsx
+from tecs_engine.extractor import WATT_RE, extract_pdf
+from tecs_engine.main import app
 from tecs_engine.models import (
     CommercialQuotationRequest,
     ComplianceRow,
@@ -21,9 +21,9 @@ from tecs_engine.models import (
     FixtureRequirement,
     ProductMatch,
     ProductSearchRequest,
+    ProjectDetails,
     QuoteRequest,
     SelectedLine,
-    ProjectDetails,
     TechnicalItem,
     TechnicalSheetRequest,
 )
@@ -342,6 +342,7 @@ def test_builds_commercial_workbook_from_exact_template() -> None:
         ),
         currency="GBP",
         exchange_rates={"EUR": 0.85},
+        freight_percent=12.5,
         items=[
             TechnicalItem(
                 id="f1",
@@ -386,7 +387,7 @@ def test_builds_commercial_workbook_from_exact_template() -> None:
         assert sheet["I16"].value == 27.5
         assert sheet["J16"].value == 1
         assert sheet["K16"].value == 0.85
-        assert sheet["L16"].value == 1.15
+        assert sheet["L16"].value == 1.125
         assert sheet["M16"].value == '=IF(I16="","",F16*I16*J16*K16*(L16-1))'
         assert sheet["N16"].value == 1.07
         assert sheet["O16"].value == 0

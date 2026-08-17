@@ -108,7 +108,7 @@ def _populate_sheet(sheet, request: CommercialQuotationRequest) -> None:
         sheet.cell(row=row, column=9, value=item.unit_price)
         sheet.cell(row=row, column=10, value=1)
         sheet.cell(row=row, column=11, value=exchange_rate if item.unit_price is not None else None)
-        sheet.cell(row=row, column=12, value=1.15)
+        sheet.cell(row=row, column=12, value=1 + (request.freight_percent / 100))
         sheet.cell(row=row, column=13, value=f'=IF(I{row}="","",F{row}*I{row}*J{row}*K{row}*(L{row}-1))')
         sheet.cell(row=row, column=14, value=1.07)
         sheet.cell(row=row, column=15, value=0)
@@ -137,7 +137,7 @@ def _populate_sheet(sheet, request: CommercialQuotationRequest) -> None:
         sheet[f"B{TOTAL_ROW}"] = f"OFFER VALUE IN {offer_currency.upper()}"
         sheet[f"B{VAT_ROW}"] = f"VAT 5% IN {offer_currency.upper()}"
         sheet[f"B{GRAND_TOTAL_ROW}"] = f"TOTAL OFFER VALUE IN {offer_currency.upper()}"
-    sheet.print_area = f"A5:S152"
+    sheet.print_area = "A5:S152"
 
 
 def build_commercial_xlsx(request: CommercialQuotationRequest) -> bytes:

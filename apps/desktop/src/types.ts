@@ -60,6 +60,7 @@ export type Product = {
   brand: string;
   product_name: string;
   product_code?: string | null;
+  model_number?: string | null;
   product_url: string;
   datasheet_url?: string | null;
   image_url?: string | null;

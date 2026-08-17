@@ -14,9 +14,10 @@ The key is stored locally in that user's operating-system credential store. It i
 2. Start manually or extract a first draft from lighting PDF drawings.
 3. Enter the basic lighting-legend details for every fitting type: type, quantity, mounting, wattage, lumens, CCT, CRI, IP/IK, UGR, and controls.
 4. Choose from the approved manufacturers and browse the saved team catalogue using product-family, mounting, CCT, and control filters.
-5. If the required product is missing or outdated, use the OpenAI Responses API to research that brand's official sources and compare up to five verified options.
+5. If the required product is missing or outdated, use the OpenAI Responses API to research one to five approved brands at once. A single-brand search returns up to five options, two brands return up to three options per brand, and larger comparisons return up to two options per brand.
 6. Finalize one product, verify the live requirement comparison and deviation remarks, then enter an optional supplier currency and unit price.
-7. Select the products for submission, choose the export folder, and create individual or combined Excel/PDF technical data sheets plus the commercial Excel quotation.
+7. Select the products for submission, choose the offer currency, exchange rates and freight percentage, choose the export folder, and create individual or combined Excel/PDF technical data sheets plus the commercial Excel quotation.
+8. Projects autosave to the protected team workspace and appear under **Pending** until all required details are filled and an export has been completed. **Complete** projects remain available for any connected team member to reopen.
 
 Excel compliance exports are generated from the supplied TECS technical-compliance workbook itself. Each selected product duplicates the native item page and preserves its logo, merged cells, five-column layout, fonts, borders, row heights, column widths, and print settings.
 
@@ -66,7 +67,7 @@ Public distribution should use a Windows code-signing certificate and an Apple D
 3. Run the installer. Until the app is code-signed, Windows may show **Windows protected your PC**; use **More info** and **Run anyway** only when the installer came from the official TECS repository.
 4. Open **API settings** and enter the user's own OpenAI API key. No OpenAI key is bundled with the application.
 
-The shared Supabase catalogue contains reusable manufacturer product details only. It does not contain project names, customer files, commercial prices, exported documents, or OpenAI keys. Its publishable client key is intentionally distributable; never substitute a Supabase secret or `service_role` key in the application.
+Supabase uses two separate security boundaries. The manufacturer catalogue is intentionally shared through a distributable publishable key and contains only reusable technical product details. Customer projects, commercial prices and draft compliance work are stored in a separate table that denies direct anonymous access; the app reaches it only through a JWT-protected Edge Function plus the private TECS workspace code. The workspace code and OpenAI key are stored in the operating-system credential manager and are never committed to this repository. Exported documents and source drawings remain local.
 
 ## Repository layout
 

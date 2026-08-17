@@ -159,7 +159,7 @@ class CatalogService:
                     "Your project remains available and the refresh can be retried later."
                 )
         return ProductSearchResponse(
-            matches=matches[:5],
+            matches=matches[:request.max_results],
             searched_domain=profile.domain,
             warnings=warnings,
             source="catalog",
